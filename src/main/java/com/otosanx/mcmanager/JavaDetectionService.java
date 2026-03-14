@@ -19,19 +19,20 @@ public final class JavaDetectionService {
     private JavaDetectionService() {
     }
 
-    public static JavaDetectionResult detect(String configuredJavaPath, Path serverFolder, String jarFile, ServerSetupDetector.ServerType serverType) {
+    public static JavaDetectionResult detect(String configuredJavaPath, ServerSetupDetector.DetectionResult detection, Path serverFolder) {
+        String configuredCandidate = isUsableJavaPath(configuredJavaPath) ? configuredJavaPath : null;
         String candidate = firstValid(
-                configuredJavaPath,
+                configuredCandidate,
                 detectJavaOnPath(),
                 detectCommonWindowsJava()
         );
+        int required = detection != null ? detection.likelyRequiredJava() : inferRequiredJavaVersion(serverFolder, "", ServerSetupDetector.ServerType.UNKNOWN);
         if (candidate == null) {
-            return new JavaDetectionResult("", "No Java installation detected.", -1, inferRequiredJavaVersion(serverFolder, jarFile, serverType), "No Java found. Use Detect Java or choose a Java install manually.");
+            return new JavaDetectionResult(configuredJavaPath, "", "No Java installation detected.", -1, required, "No Java found. Use Detect Java or choose a Java install manually.");
         }
 
         String versionText = readJavaVersion(candidate);
         int major = parseMajorVersion(versionText);
-        int required = inferRequiredJavaVersion(serverFolder, jarFile, serverType);
         String note;
         if (major < 0) {
             note = "Java was found, but the version could not be read.";
@@ -42,7 +43,7 @@ public final class JavaDetectionService {
         } else {
             note = "Detected Java " + major + ".";
         }
-        return new JavaDetectionResult(candidate, versionText, major, required, note);
+        return new JavaDetectionResult(configuredJavaPath, candidate, versionText, major, required, note);
     }
 
     private static String detectJavaOnPath() {
@@ -145,13 +146,23 @@ public final class JavaDetectionService {
         return null;
     }
 
-    public record JavaDetectionResult(String detectedPath, String versionText, int majorVersion, int requiredMajorVersion, String note) {
+    private static boolean isUsableJavaPath(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        Path path = Paths.get(value);
+        return Files.exists(path) || "java".equalsIgnoreCase(value.trim()) || value.trim().toLowerCase(Locale.ROOT).endsWith("java.exe");
+    }
+
+    public record JavaDetectionResult(String configuredPath, String detectedPath, String versionText, int majorVersion, int requiredMajorVersion, String note) {
         public static JavaDetectionResult empty() {
-            return new JavaDetectionResult("", "", -1, -1, "Java has not been checked yet.");
+            return new JavaDetectionResult("", "", "", -1, -1, "Java has not been checked yet.");
         }
 
         public String summary() {
-            return note + (detectedPath == null || detectedPath.isBlank() ? "" : " Path: " + detectedPath);
+            String configured = configuredPath == null || configuredPath.isBlank() ? "Not set" : configuredPath;
+            String actual = detectedPath == null || detectedPath.isBlank() ? "Unavailable" : detectedPath;
+            return "Configured Java: " + configured + ". Detected Java: " + shortDisplay() + " at " + actual + ". " + note;
         }
 
         public String shortDisplay() {

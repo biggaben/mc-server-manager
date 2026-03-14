@@ -9,6 +9,10 @@ import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.text.JTextComponent;
 import java.awt.*;
 import java.awt.event.ActionListener;
+import java.awt.event.ComponentAdapter;
+import java.awt.event.ComponentEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.net.URI;
@@ -18,8 +22,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Consumer;
 
 public class Main {
     private static final String TRANSPARENT_PANEL_PROPERTY = "mcmanager.transparentPanel";
@@ -30,6 +39,8 @@ public class Main {
     private static final String CLOSE_TO_TRAY = "MINIMIZE_TO_TRAY";
     private static final String CLOSE_TO_TASKBAR = "MINIMIZE_TO_TASKBAR";
     private static final String CLOSE_EXIT = "EXIT";
+    private static final int MIN_PANEL_WIDTH = 320;
+    private static final int MIN_PANEL_HEIGHT = 220;
 
     private final ServerManager serverManager = new ServerManager();
     private AppConfig config;
@@ -54,12 +65,10 @@ public class Main {
     private JCheckBox monitorTpsBox;
     private JCheckBox monitorPlayerCountBox;
     private JCheckBox monitorLatencyBox;
-    private JCheckBox monitorJavaStatusBox;
-    private JCheckBox monitorServerTypeBox;
-    private JCheckBox monitorRestartStateBox;
     private JComboBox<Integer> restartDelayCombo;
     private JComboBox<Integer> safeStopCombo;
     private JComboBox<Integer> monitoringRateCombo;
+    private JComboBox<String> compactPriorityCombo;
     private JTextArea jvmArgsArea;
     private JTextArea logArea;
     private JTextArea consolePreviewArea;
@@ -67,6 +76,7 @@ public class Main {
     private JTextField playitPathField;
     private JLabel statusLabel;
     private JLabel detectedTypeLabel;
+    private JLabel detectedVersionLabel;
     private JLabel jvmRecommendationLabel;
     private JLabel javaStatusLabel;
     private JLabel perfStatusLabel;
@@ -78,6 +88,7 @@ public class Main {
     private JLabel perfServerCpuLabel;
     private JLabel perfJavaLabel;
     private JLabel perfTypeLabel;
+    private JLabel perfVersionLabel;
     private JLabel perfPlayersLabel;
     private JComboBox<String> themeModeCombo;
     private JComboBox<String> closeBehaviorCombo;
@@ -94,21 +105,36 @@ public class Main {
     private JButton playitBrowseButton;
     private JButton optionsButton;
     private JButton performanceMonitorButton;
+    private JButton openServerFolderButton;
+    private JButton resetLayoutButton;
     private CollapsibleSection serverSettingsSection;
-    private CollapsibleSection sidebarSection;
+    private CollapsibleSection quickActionsSection;
     private CollapsibleSection consoleSection;
-    private CollapsibleSection commandSection;
+    private CollapsibleSection performanceSection;
     private TrayIcon trayIcon;
     private JDialog optionsDialog;
-    private JDialog performanceDialog;
     private Color customBackgroundColor = Color.decode("#1F2430");
     private Color customInputColor = Color.decode("#2A3140");
+    private JPanel collapsedBarPanel;
     private boolean settingsLocked;
     private boolean monitoringPausedForVisibility;
+    private boolean eulaDeclinedThisSession;
+    private boolean eulaPromptOpen;
+    private boolean responsiveLayoutApplying;
     private ServerSetupDetector.ServerType detectedServerType = ServerSetupDetector.ServerType.UNKNOWN;
     private JavaDetectionService.JavaDetectionResult detectedJavaInfo = JavaDetectionService.JavaDetectionResult.empty();
     private final List<String> recentConsoleLines = new ArrayList<>();
+    private final Map<String, CollapsibleSection> dockSections = new LinkedHashMap<>();
+    private final Map<String, DockSlotPanel> dockSlots = new LinkedHashMap<>();
+    private final Map<String, JButton> collapsedSectionButtons = new LinkedHashMap<>();
+    private final Map<String, JButton> overflowSectionButtons = new LinkedHashMap<>();
+    private final Map<String, JDialog> floatingSectionDialogs = new LinkedHashMap<>();
+    private final Map<String, String> lastDockSlots = new LinkedHashMap<>();
+    private final Set<String> responsiveCollapsedSections = new LinkedHashSet<>();
+    private final List<String> currentResponsiveVisibleSectionIds = new ArrayList<>();
+    private JPanel dockLayoutContainer;
     private Timer performanceTimer;
+    private LayoutMode currentLayoutMode = null;
 
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> new Main().start());
@@ -156,10 +182,8 @@ public class Main {
         frame.setContentPane(root);
         root.add(buildTopBar(), BorderLayout.NORTH);
         root.add(buildMainPanel(), BorderLayout.CENTER);
-        root.add(buildBottomPanel(), BorderLayout.SOUTH);
 
         buildOptionsDialog();
-        buildPerformanceDialog();
 
         installTray();
         frame.addWindowListener(new WindowAdapter() {
@@ -191,51 +215,80 @@ public class Main {
                 resumeMonitoringIfAllowed("Monitoring resumed after restoring the window.");
             }
         });
+        frame.addComponentListener(new ComponentAdapter() {
+            @Override
+            public void componentResized(ComponentEvent e) {
+                handleResponsiveLayout();
+            }
+        });
     }
 
     private JPanel buildTopBar() {
         JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
         markPanelTransparent(panel);
         optionsButton = createActionButton("Options", e -> openOptionsDialog());
-        performanceMonitorButton = createActionButton("Performance Monitor", e -> openPerformanceDialog());
+        performanceMonitorButton = createActionButton("Performance Monitor", e -> openPerformanceMonitorWindow());
+        openServerFolderButton = createActionButton("Open Server Folder", e -> openServerFolder());
+        resetLayoutButton = createActionButton("Reset Layout", e -> resetDockLayout());
         optionsButton.setToolTipText("Open app options and monitoring settings in a separate window.");
-        performanceMonitorButton.setToolTipText("Open the live performance monitor in a separate window.");
+        performanceMonitorButton.setToolTipText("Open the Performance Monitor panel in its own floating window.");
+        openServerFolderButton.setToolTipText("Open the selected server folder in Windows Explorer.");
+        resetLayoutButton.setToolTipText("Restore the default panel layout and sizes.");
         panel.add(optionsButton);
         panel.add(performanceMonitorButton);
+        panel.add(openServerFolderButton);
+        panel.add(resetLayoutButton);
         return panel;
     }
 
     private JPanel buildMainPanel() {
         JPanel panel = new JPanel(new BorderLayout(12, 12));
         markPanelTransparent(panel);
-        JPanel leftContent = new JPanel(new BorderLayout(12, 12));
-        markPanelTransparent(leftContent);
-        leftContent.add(buildSettingsPanel(), BorderLayout.NORTH);
-        leftContent.add(buildCenterPanel(), BorderLayout.CENTER);
-        panel.add(leftContent, BorderLayout.CENTER);
-        panel.add(buildSidebarPanel(), BorderLayout.EAST);
+        initializeDockSections();
+        collapsedBarPanel = buildCollapsedBar();
+        panel.add(collapsedBarPanel, BorderLayout.NORTH);
+        panel.add(buildDockLayoutPanel(), BorderLayout.CENTER);
         return panel;
     }
 
-    private JComponent buildSidebarPanel() {
-        JPanel sidebarContent = new JPanel();
-        markPanelTransparent(sidebarContent);
-        sidebarContent.setLayout(new BoxLayout(sidebarContent, BoxLayout.Y_AXIS));
-        sidebarContent.add(buildQuickActionsPanel());
-        sidebarContent.add(Box.createVerticalGlue());
-
-        sidebarSection = createSectionPanel("Quick Actions", sidebarContent, true);
-
-        JScrollPane scrollPane = new JScrollPane(sidebarSection);
-        scrollPane.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
-        scrollPane.setBorder(BorderFactory.createEmptyBorder());
-        scrollPane.setPreferredSize(new Dimension(400, 0));
-        scrollPane.setMinimumSize(new Dimension(360, 0));
-        scrollPane.getVerticalScrollBar().setUnitIncrement(16);
-        return scrollPane;
+    private JPanel buildCollapsedBar() {
+        JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        markPanelTransparent(panel);
+        panel.setVisible(false);
+        return panel;
     }
 
-    private JPanel buildSettingsPanel() {
+    private void initializeDockSections() {
+        dockSections.clear();
+        lastDockSlots.clear();
+        serverSettingsSection = createDockableSection("SERVER_SETTINGS", "Server Settings", wrapServerSettingsInScrollPane(buildSettingsContent()), true, null);
+        quickActionsSection = createDockableSection("QUICK_ACTIONS", "Quick Actions", wrapPanelInScrollPaneIfNeeded(buildQuickActionsContent()), true, null);
+        consoleSection = createDockableSection("LIVE_CONSOLE", "Live Console", buildConsoleContent(), true, createWrappedScrollPane(consolePreviewArea = buildConsolePreviewArea()));
+        performanceSection = createDockableSection("PERFORMANCE_MONITOR", "Performance Monitor", wrapPanelInScrollPaneIfNeeded(buildPerformanceContent()), true, null);
+        lastDockSlots.put("SERVER_SETTINGS", "TOP_LEFT");
+        lastDockSlots.put("QUICK_ACTIONS", "TOP_RIGHT");
+        lastDockSlots.put("LIVE_CONSOLE", "BOTTOM_LEFT");
+        lastDockSlots.put("PERFORMANCE_MONITOR", "BOTTOM_RIGHT");
+    }
+
+    private JComponent buildDockLayoutPanel() {
+        dockSlots.clear();
+        DockSlotPanel topLeft = createDockSlot("TOP_LEFT");
+        DockSlotPanel topRight = createDockSlot("TOP_RIGHT");
+        DockSlotPanel bottomLeft = createDockSlot("BOTTOM_LEFT");
+        DockSlotPanel bottomRight = createDockSlot("BOTTOM_RIGHT");
+
+        applySavedDockLayout();
+        JPanel wrapper = new JPanel(new BorderLayout());
+        markPanelTransparent(wrapper);
+        dockLayoutContainer = new JPanel(new BorderLayout());
+        markPanelTransparent(dockLayoutContainer);
+        wrapper.add(dockLayoutContainer, BorderLayout.CENTER);
+        SwingUtilities.invokeLater(this::handleResponsiveLayout);
+        return wrapper;
+    }
+
+    private JPanel buildSettingsContent() {
         JPanel content = new JPanel(new GridBagLayout());
         markPanelTransparent(content);
         GridBagConstraints gbc = new GridBagConstraints();
@@ -253,7 +306,16 @@ public class Main {
         jvmArgsArea = new JTextArea(4, 30);
         jvmArgsArea.setLineWrap(true);
         jvmArgsArea.setWrapStyleWord(true);
+        configureResizableField(profileNameField, 26);
+        configureResizableField(folderField, 30);
+        configureResizableField(jarField, 24);
+        configureResizableField(javaField, 24);
+        configureResizableField(xmsField, 10);
+        configureResizableField(xmxField, 10);
+        configureResizableField(serverArgsField, 24);
+        jvmArgsArea.setColumns(32);
         detectedTypeLabel = createSectionLabel("Detected Type: Unknown");
+        detectedVersionLabel = createSectionLabel("Minecraft Version: Unknown");
         settingsLockButton = createActionButton("Unlock Settings", e -> setSettingsLocked(!settingsLocked));
         detectSettingsButton = createActionButton("Detect Existing Settings", e -> autoDetectServerSettings(true));
         jvmRecommendationLabel = createSectionLabel("JVM Recommendation: detect a server to see suggestions.");
@@ -272,6 +334,7 @@ public class Main {
         serverArgsField.setToolTipText("Extra server launch arguments such as nogui.");
         jvmArgsArea.setToolTipText("Advanced Java launch options. Only change these if you know what they do.");
         detectedTypeLabel.setToolTipText("The server type detected from your jar, scripts, and server files.");
+        detectedVersionLabel.setToolTipText("The Minecraft version detected from launcher files, jar metadata, or version metadata.");
         settingsLockButton.setToolTipText("Lock settings to prevent accidental edits or auto-detection changes.");
         detectSettingsButton.setToolTipText("Scan the selected server folder for an existing launcher and import detected settings.");
         jvmRecommendationLabel.setToolTipText("Shows whether the manager found a safer or more optimized JVM arg suggestion.");
@@ -291,6 +354,13 @@ public class Main {
         gbc.gridwidth = 1;
         gbc.weightx = 0;
         content.add(settingsLockButton, gbc);
+        row++;
+
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        gbc.gridwidth = 3;
+        gbc.weightx = 1;
+        content.add(detectedVersionLabel, gbc);
         row++;
 
         gbc.gridx = 0;
@@ -353,18 +423,17 @@ public class Main {
         gbc.gridwidth = 3;
         gbc.weightx = 1;
         content.add(saveServerSettingsButton, gbc);
-        serverSettingsSection = createSectionPanel("Server Settings", content, true);
-        return serverSettingsSection;
+        return content;
     }
 
-    private JPanel buildQuickActionsPanel() {
+    private JPanel buildQuickActionsContent() {
         JPanel content = new JPanel();
         markPanelTransparent(content);
         content.setLayout(new BoxLayout(content, BoxLayout.Y_AXIS));
 
         RoundedButton saveButton = createActionButton("Save Settings", e -> {
             configFromUi();
-            saveConfig(true);
+            saveConfig(false);
             appendLog("Settings saved to: " + ConfigService.getConfigFile());
         });
         RoundedButton startButton = createActionButton("Start Server", e -> doStart());
@@ -426,7 +495,7 @@ public class Main {
         content.add(safeStopCombo);
 
         alignSidebarComponents(content);
-        return createSectionPanel("Quick Actions", content, false);
+        return content;
     }
 
     private void buildOptionsDialog() {
@@ -447,6 +516,10 @@ public class Main {
         startMinimizedBox = new JCheckBox("Start minimized");
         themeModeCombo = new JComboBox<>(new String[]{"Match Windows", "Dark", "Light", "Custom"});
         closeBehaviorCombo = new JComboBox<>(new String[]{"Close to tray icon", "Close to taskbar", "Exit application"});
+        compactPriorityCombo = new JComboBox<>(new String[]{"Server Settings", "Quick Actions", "Live Console", "Performance Monitor"});
+        prepareComboBox(themeModeCombo, null);
+        prepareComboBox(closeBehaviorCombo, null);
+        prepareComboBox(compactPriorityCombo, null);
         backgroundColorButton = createActionButton("Choose Background Color", e -> chooseCustomBackgroundColor());
         inputColorButton = createActionButton("Choose Input Color", e -> chooseCustomInputColor());
         playitCheckBox = new JCheckBox("Check for Playit.gg before starting");
@@ -456,19 +529,17 @@ public class Main {
         monitoringEnabledBox = new JCheckBox("Enable performance monitoring");
         monitorSystemCpuBox = new JCheckBox("Monitor system CPU usage");
         monitorSystemMemoryBox = new JCheckBox("Monitor system RAM usage");
-        monitorServerMemoryBox = new JCheckBox("Monitor server memory target");
+        monitorServerMemoryBox = new JCheckBox("Monitor server process memory");
         monitorUptimeBox = new JCheckBox("Monitor server uptime");
         monitorTpsBox = new JCheckBox("Monitor TPS when available");
         monitorPlayerCountBox = new JCheckBox("Monitor player count when available");
         monitorLatencyBox = new JCheckBox("Monitor latency/ping when available");
-        monitorJavaStatusBox = new JCheckBox("Monitor Java version/status");
-        monitorServerTypeBox = new JCheckBox("Monitor server type/status");
-        monitorRestartStateBox = new JCheckBox("Monitor restart state and reason");
         monitoringRateCombo = createPollingRateDropdown();
 
         startMinimizedBox.setToolTipText("Open the manager minimized instead of showing the full window immediately.");
         themeModeCombo.setToolTipText("Choose whether the app matches Windows, uses dark mode, light mode, or your custom colors.");
         closeBehaviorCombo.setToolTipText("Choose what happens when you close the manager window.");
+        compactPriorityCombo.setToolTipText("Choose which section stays most visible when the window becomes too small.");
         playitCheckBox.setToolTipText("Check whether Playit.gg is already running before the server starts.");
         playitStartBox.setToolTipText("If enabled, the manager will try to start Playit.gg when it is not already running.");
         playitPathField.setToolTipText("Optional path to your Playit.gg executable for automatic startup.");
@@ -476,14 +547,11 @@ public class Main {
         monitoringEnabledBox.setToolTipText("Turn all performance monitoring on or off.");
         monitorSystemCpuBox.setToolTipText("Check overall CPU use on this computer.");
         monitorSystemMemoryBox.setToolTipText("Check overall RAM use on this computer.");
-        monitorServerMemoryBox.setToolTipText("Show the server's configured Java memory target.");
+        monitorServerMemoryBox.setToolTipText("Check the Minecraft server process memory usage when the server is running.");
         monitorUptimeBox.setToolTipText("Track how long the current server process has been running.");
         monitorTpsBox.setToolTipText("Only use TPS checks if your setup exposes that information safely.");
         monitorPlayerCountBox.setToolTipText("Only use player-count checks if they are available safely.");
         monitorLatencyBox.setToolTipText("Latency is only shown when it can be measured safely.");
-        monitorJavaStatusBox.setToolTipText("Show the detected Java version and compatibility note.");
-        monitorServerTypeBox.setToolTipText("Show the detected server type, such as Vanilla or Fabric.");
-        monitorRestartStateBox.setToolTipText("Show whether a restart is pending and the last restart reason.");
         monitoringRateCombo.setToolTipText("Choose how often the performance window refreshes.");
 
         themeModeCombo.addActionListener(e -> {
@@ -497,17 +565,18 @@ public class Main {
         });
         for (JCheckBox box : List.of(
                 monitorSystemCpuBox, monitorSystemMemoryBox, monitorServerMemoryBox, monitorUptimeBox,
-                monitorTpsBox, monitorPlayerCountBox, monitorLatencyBox, monitorJavaStatusBox,
-                monitorServerTypeBox, monitorRestartStateBox)) {
+                monitorTpsBox, monitorPlayerCountBox, monitorLatencyBox)) {
             box.addActionListener(e -> {
                 startPerformanceTimer();
                 updatePerformanceStats();
             });
         }
         monitoringRateCombo.addActionListener(e -> startPerformanceTimer());
+        compactPriorityCombo.addActionListener(e -> handleResponsiveLayout());
 
         addOptionRow(content, gbc, "Theme", themeModeCombo);
         addOptionRow(content, gbc, "Close Button", closeBehaviorCombo);
+        addOptionRow(content, gbc, "Preferred section when space is limited", compactPriorityCombo);
         addOptionRow(content, gbc, "Custom Background", backgroundColorButton);
         addOptionRow(content, gbc, "Custom Inputs", inputColorButton);
         addOptionRow(content, gbc, "Playit.gg Path", buildLabeledInlinePanel(playitPathField, playitBrowseButton));
@@ -537,12 +606,6 @@ public class Main {
         gbc.gridy++;
         content.add(monitorLatencyBox, gbc);
         gbc.gridy++;
-        content.add(monitorJavaStatusBox, gbc);
-        gbc.gridy++;
-        content.add(monitorServerTypeBox, gbc);
-        gbc.gridy++;
-        content.add(monitorRestartStateBox, gbc);
-        gbc.gridy++;
 
         JLabel hintLabel = new JLabel("<html>Monitoring pauses automatically while the app is minimized to the tray or taskbar.</html>");
         hintLabel.setFont(hintLabel.getFont().deriveFont(Font.PLAIN, 12f));
@@ -552,6 +615,7 @@ public class Main {
             configFromUi();
             saveConfig(false);
             startPerformanceTimer();
+            handleResponsiveLayout();
             optionsDialog.setVisible(false);
         });
         saveOptionsButton.setToolTipText("Save options and close this window.");
@@ -567,17 +631,76 @@ public class Main {
                 configFromUi();
                 saveConfig(false);
                 startPerformanceTimer();
+                handleResponsiveLayout();
             }
         });
     }
 
-    private void buildPerformanceDialog() {
-        performanceDialog = new JDialog(frame, "Performance Monitor", false);
-        performanceDialog.setDefaultCloseOperation(WindowConstants.HIDE_ON_CLOSE);
-        performanceDialog.setSize(460, 420);
-        performanceDialog.setLocationRelativeTo(frame);
+    private void openOptionsDialog() {
+        if (optionsDialog == null) {
+            buildOptionsDialog();
+            applyConfigToUi();
+            applyTheme();
+        }
+        optionsDialog.setLocationRelativeTo(frame);
+        optionsDialog.setVisible(true);
+    }
 
+    private void openPerformanceMonitorWindow() {
+        JDialog existing = floatingSectionDialogs.get("PERFORMANCE_MONITOR");
+        if (existing != null) {
+            existing.toFront();
+            existing.requestFocus();
+            return;
+        }
+        restoreCollapsedSection("PERFORMANCE_MONITOR");
+        Point point = new Point(frame.getX() + 80, frame.getY() + 80);
+        floatSection("PERFORMANCE_MONITOR", point);
+    }
+
+    private JTextArea buildConsoleArea() {
+        JTextArea area = new JTextArea();
+        area.setEditable(false);
+        area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        area.setToolTipText("Shows the full live console output from the Minecraft server.");
+        return area;
+    }
+
+    private JTextArea buildConsolePreviewArea() {
+        JTextArea preview = new JTextArea(3, 30);
+        preview.setEditable(false);
+        preview.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        preview.setLineWrap(true);
+        preview.setWrapStyleWord(true);
+        preview.setToolTipText("Shows the last three console lines while the full console is collapsed.");
+        return preview;
+    }
+
+    private JComponent buildConsoleContent() {
+        JPanel panel = new JPanel(new BorderLayout(10, 10));
+        markPanelTransparent(panel);
+        logArea = buildConsoleArea();
+        panel.add(createWrappedScrollPane(logArea), BorderLayout.CENTER);
+        panel.add(buildConsoleCommandBar(), BorderLayout.SOUTH);
+        return panel;
+    }
+
+    private JComponent buildConsoleCommandBar() {
+        JPanel content = new JPanel(new BorderLayout(10, 10));
+        markPanelTransparent(content);
+        commandField = new JTextField();
+        commandField.setToolTipText("Send a server command directly to the running console.");
+        RoundedButton sendButton = createActionButton("Send", e -> sendCommandFromBox());
+        sendButton.setToolTipText("Send the typed command to the running server.");
+        commandField.addActionListener(e -> sendCommandFromBox());
+        content.add(commandField, BorderLayout.CENTER);
+        content.add(sendButton, BorderLayout.EAST);
+        return content;
+    }
+
+    private JPanel buildPerformanceContent() {
         JPanel content = new JPanel(new GridBagLayout());
+        markPanelTransparent(content);
         GridBagConstraints gbc = new GridBagConstraints();
         gbc.gridx = 0;
         gbc.gridy = 0;
@@ -591,10 +714,11 @@ public class Main {
         perfRestartLabel = createSectionLabel("Restart: None pending");
         perfSystemCpuLabel = createSectionLabel("System CPU: Unavailable");
         perfSystemMemoryLabel = createSectionLabel("System Memory: Unavailable");
-        perfServerMemoryLabel = createSectionLabel("Server Memory: Unavailable");
+        perfServerMemoryLabel = createSectionLabel("Server Memory: Offline");
         perfServerCpuLabel = createSectionLabel("Server CPU Time: Unavailable");
         perfJavaLabel = createSectionLabel("Java: Unavailable");
         perfTypeLabel = createSectionLabel("Server Type: Unknown");
+        perfVersionLabel = createSectionLabel("Minecraft Version: Unknown");
         perfPlayersLabel = createSectionLabel("Players/TPS: Unavailable");
 
         perfStatusLabel.setToolTipText("Shows the current state of the managed Minecraft server process.");
@@ -602,76 +726,614 @@ public class Main {
         perfRestartLabel.setToolTipText("Shows whether a restart countdown is pending or was cancelled.");
         perfSystemCpuLabel.setToolTipText("Approximate total CPU usage on this computer.");
         perfSystemMemoryLabel.setToolTipText("Approximate total RAM usage on this computer.");
-        perfServerMemoryLabel.setToolTipText("Shows the configured Java memory target for this server.");
+        perfServerMemoryLabel.setToolTipText("Shows the Minecraft server process memory usage when it is available.");
         perfServerCpuLabel.setToolTipText("CPU time used by the server process when available.");
         perfJavaLabel.setToolTipText("Shows the detected Java runtime version and compatibility note.");
         perfTypeLabel.setToolTipText("Shows the detected server loader type.");
+        perfVersionLabel.setToolTipText("Shows the detected Minecraft version when enough evidence exists.");
         perfPlayersLabel.setToolTipText("TPS, players, and ping only appear when they are available safely.");
 
         for (JLabel label : List.of(
                 perfStatusLabel, perfUptimeLabel, perfRestartLabel, perfSystemCpuLabel,
                 perfSystemMemoryLabel, perfServerMemoryLabel, perfServerCpuLabel,
-                perfJavaLabel, perfTypeLabel, perfPlayersLabel)) {
+                perfJavaLabel, perfTypeLabel, perfVersionLabel, perfPlayersLabel)) {
             content.add(label, gbc);
             gbc.gridy++;
         }
 
-        performanceDialog.setContentPane(content);
+        return content;
     }
 
-    private void openOptionsDialog() {
-        if (optionsDialog == null) {
-            buildOptionsDialog();
-            applyConfigToUi();
-            applyTheme();
+    private CollapsibleSection createDockableSection(String sectionId, String title, JComponent content, boolean collapsible, JComponent collapsedPreview) {
+        CollapsibleSection section = createSectionPanel(title, content, collapsible, collapsedPreview);
+        DockDragHandler dragHandler = new DockDragHandler(sectionId, section);
+        section.addHeaderMouseListener(dragHandler);
+        section.addHeaderMouseMotionListener(dragHandler);
+        section.setToggleHandler(collapsed -> {
+            if (collapsed) {
+                collapseDockSection(sectionId);
+            } else {
+                restoreCollapsedSection(sectionId);
+            }
+        });
+        dockSections.put(sectionId, section);
+        return section;
+    }
+
+    private DockSlotPanel createDockSlot(String slotId) {
+        DockSlotPanel slot = new DockSlotPanel(slotId);
+        slot.setMinimumSize(new Dimension(260, 180));
+        dockSlots.put(slotId, slot);
+        return slot;
+    }
+
+    private void applySavedDockLayout() {
+        moveDockSection(config.layoutTopLeftSection, "TOP_LEFT", false);
+        moveDockSection(config.layoutTopRightSection, "TOP_RIGHT", false);
+        moveDockSection(config.layoutBottomLeftSection, "BOTTOM_LEFT", false);
+        moveDockSection(config.layoutBottomRightSection, "BOTTOM_RIGHT", false);
+        SwingUtilities.invokeLater(this::handleResponsiveLayout);
+    }
+
+    private void captureDockLayout() {
+        config.layoutTopLeftSection = sectionIdForSlot("TOP_LEFT", config.layoutTopLeftSection);
+        config.layoutTopRightSection = sectionIdForSlot("TOP_RIGHT", config.layoutTopRightSection);
+        config.layoutBottomLeftSection = sectionIdForSlot("BOTTOM_LEFT", config.layoutBottomLeftSection);
+        config.layoutBottomRightSection = sectionIdForSlot("BOTTOM_RIGHT", config.layoutBottomRightSection);
+    }
+
+    private String sectionIdForSlot(String slotId, String fallback) {
+        DockSlotPanel slot = dockSlots.get(slotId);
+        if (slot == null || slot.getSection() == null) {
+            return fallback;
         }
-        optionsDialog.setLocationRelativeTo(frame);
-        optionsDialog.setVisible(true);
+        String sectionId = findSectionId(slot.getSection());
+        return sectionId != null ? sectionId : fallback;
     }
 
-    private void openPerformanceDialog() {
-        if (performanceDialog == null) {
-            buildPerformanceDialog();
-            applyTheme();
+    private void moveDockSection(String sectionId, String slotId, boolean logMove) {
+        CollapsibleSection section = dockSections.get(sectionId);
+        DockSlotPanel targetSlot = dockSlots.get(slotId);
+        if (section == null || targetSlot == null) {
+            return;
         }
-        updatePerformanceStats();
-        performanceDialog.setLocationRelativeTo(frame);
-        performanceDialog.setVisible(true);
+
+        removeCollapsedButton(sectionId);
+        disposeFloatingDialog(sectionId);
+        String currentSlotId = findSlotForSection(sectionId);
+        if (slotId.equals(currentSlotId)) {
+            return;
+        }
+
+        if (currentSlotId != null) {
+            DockSlotPanel currentSlot = dockSlots.get(currentSlotId);
+            CollapsibleSection displaced = targetSlot.getSection();
+            currentSlot.setSection(displaced);
+            targetSlot.setSection(section);
+        } else if (targetSlot.getSection() == null) {
+            targetSlot.setSection(section);
+        } else {
+            String displacedId = findSectionId(targetSlot.getSection());
+            targetSlot.setSection(section);
+            if (displacedId != null) {
+                DockSlotPanel emptySlot = findEmptySlot();
+                if (emptySlot != null) {
+                    emptySlot.setSection(dockSections.get(displacedId));
+                }
+            }
+        }
+
+        lastDockSlots.put(sectionId, slotId);
+        section.setCollapsedDirect(false);
+        if (!responsiveLayoutApplying) {
+            captureDockLayout();
+        }
+        frame.revalidate();
+        frame.repaint();
+        if (logMove) {
+            appendLog(section.getTitleText() + " moved to " + slotDisplayName(slotId) + ".");
+        }
+        if (!responsiveLayoutApplying) {
+            handleResponsiveLayout();
+        }
     }
 
-    private JPanel buildCenterPanel() {
-        logArea = new JTextArea();
-        logArea.setEditable(false);
-        logArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        logArea.setToolTipText("Shows the full live console output from the Minecraft server.");
-        consolePreviewArea = new JTextArea(3, 30);
-        consolePreviewArea.setEditable(false);
-        consolePreviewArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        consolePreviewArea.setLineWrap(true);
-        consolePreviewArea.setWrapStyleWord(true);
-        consolePreviewArea.setToolTipText("Shows the last three console lines while the full console is collapsed.");
-        consoleSection = createSectionPanel("Live Console", createWrappedScrollPane(logArea), true, createWrappedScrollPane(consolePreviewArea));
-        return consoleSection;
+    private void collapseDockSection(String sectionId) {
+        CollapsibleSection section = dockSections.get(sectionId);
+        if (section == null) {
+            return;
+        }
+        String currentSlot = findSlotForSection(sectionId);
+        if (currentSlot != null) {
+            lastDockSlots.put(sectionId, currentSlot);
+            DockSlotPanel slot = dockSlots.get(currentSlot);
+            if (slot != null) {
+                slot.setSection(null);
+            }
+        }
+        disposeFloatingDialog(sectionId);
+        section.setCollapsedDirect(true);
+        JButton restoreButton = createCollapsedRestoreButton(sectionId, section.getTitleText());
+        collapsedSectionButtons.put(sectionId, restoreButton);
+        refreshCollapsedBar();
+        handleResponsiveLayout();
+        frame.revalidate();
+        frame.repaint();
     }
 
-    private JPanel buildBottomPanel() {
-        JPanel content = new JPanel(new BorderLayout(10, 10));
-        markPanelTransparent(content);
-        commandField = new JTextField();
-        commandField.setToolTipText("Send a server command directly to the running console.");
-        RoundedButton sendButton = createActionButton("Send", e -> sendCommandFromBox());
-        sendButton.setToolTipText("Send the typed command to the running server.");
-        commandField.addActionListener(e -> sendCommandFromBox());
-        RoundedButton openFolderButton = createActionButton("Open Server Folder", e -> openServerFolder());
-        openFolderButton.setToolTipText("Open the selected server folder in Windows Explorer.");
-        JPanel left = new JPanel(new BorderLayout(8, 8));
-        markPanelTransparent(left);
-        left.add(commandField, BorderLayout.CENTER);
-        left.add(sendButton, BorderLayout.EAST);
-        content.add(left, BorderLayout.CENTER);
-        content.add(openFolderButton, BorderLayout.EAST);
-        commandSection = createSectionPanel("Send Command", content, false);
-        return commandSection;
+    private void restoreCollapsedSection(String sectionId) {
+        CollapsibleSection section = dockSections.get(sectionId);
+        if (section == null) {
+            return;
+        }
+        removeCollapsedButton(sectionId);
+        section.setCollapsedDirect(false);
+        moveDockSection(sectionId, lastDockSlots.getOrDefault(sectionId, defaultSlotForSection(sectionId)), false);
+        frame.revalidate();
+        frame.repaint();
+    }
+
+    private JButton createCollapsedRestoreButton(String sectionId, String title) {
+        RoundedButton button = createActionButton(title, e -> restoreCollapsedSection(sectionId));
+        button.setToolTipText("Restore " + title + " to the dashboard.");
+        if ("LIVE_CONSOLE".equals(sectionId)) {
+            button.setToolTipText("Restore Live Console. Recent lines: " + getLastConsoleLines(3).replace(System.lineSeparator(), " | "));
+        }
+        return button;
+    }
+
+    private void removeCollapsedButton(String sectionId) {
+        JButton button = collapsedSectionButtons.remove(sectionId);
+        if (button != null && collapsedBarPanel != null) {
+            refreshCollapsedBar();
+        }
+    }
+
+    private void floatSection(String sectionId, Point screenPoint) {
+        CollapsibleSection section = dockSections.get(sectionId);
+        if (section == null) {
+            return;
+        }
+        String currentSlot = findSlotForSection(sectionId);
+        if (currentSlot != null) {
+            lastDockSlots.put(sectionId, currentSlot);
+            DockSlotPanel slot = dockSlots.get(currentSlot);
+            if (slot != null) {
+                slot.setSection(null);
+            }
+        }
+        removeCollapsedButton(sectionId);
+        JDialog dialog = floatingSectionDialogs.get(sectionId);
+        if (dialog == null) {
+            dialog = new JDialog(frame, section.getTitleText(), false);
+            dialog.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
+            JDialog finalDialog = dialog;
+            dialog.addWindowListener(new WindowAdapter() {
+                @Override
+                public void windowClosing(WindowEvent e) {
+                    moveDockSection(sectionId, lastDockSlots.getOrDefault(sectionId, defaultSlotForSection(sectionId)), false);
+                    finalDialog.dispose();
+                    floatingSectionDialogs.remove(sectionId);
+                }
+            });
+            floatingSectionDialogs.put(sectionId, dialog);
+        } else {
+            dialog.getContentPane().removeAll();
+        }
+        section.setCollapsedDirect(false);
+        dialog.setContentPane(section);
+        dialog.setResizable(true);
+        dialog.pack();
+        dialog.setSize(Math.max(320, section.getWidth() + 32), Math.max(220, section.getHeight() + 48));
+        dialog.setLocation(screenPoint);
+        applyTheme();
+        dialog.setVisible(true);
+        handleResponsiveLayout();
+        frame.revalidate();
+        frame.repaint();
+    }
+
+    private void disposeFloatingDialog(String sectionId) {
+        JDialog dialog = floatingSectionDialogs.remove(sectionId);
+        if (dialog != null) {
+            dialog.setVisible(false);
+            dialog.dispose();
+        }
+    }
+
+    private String defaultSlotForSection(String sectionId) {
+        return switch (sectionId) {
+            case "SERVER_SETTINGS" -> "TOP_LEFT";
+            case "QUICK_ACTIONS" -> "TOP_RIGHT";
+            case "LIVE_CONSOLE" -> "BOTTOM_LEFT";
+            case "PERFORMANCE_MONITOR" -> "BOTTOM_RIGHT";
+            default -> "TOP_LEFT";
+        };
+    }
+
+    private String findDockSlotAt(Point screenPoint) {
+        String bestSlotId = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (DockSlotPanel slot : dockSlots.values()) {
+            if (!slot.isShowing()) {
+                continue;
+            }
+            Point slotPoint = slot.getLocationOnScreen();
+            Rectangle bounds = new Rectangle(slotPoint, slot.getSize());
+            if (bounds.contains(screenPoint)) {
+                return slot.getSlotId();
+            }
+            double centerX = bounds.getCenterX();
+            double centerY = bounds.getCenterY();
+            double distance = Point.distance(screenPoint.x, screenPoint.y, centerX, centerY);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestSlotId = slot.getSlotId();
+            }
+        }
+        return bestSlotId;
+    }
+
+    private boolean isPointInsideMainWindow(Point screenPoint) {
+        if (frame == null || !frame.isShowing()) {
+            return false;
+        }
+        Point framePoint = frame.getLocationOnScreen();
+        Rectangle bounds = new Rectangle(framePoint, frame.getSize());
+        return bounds.contains(screenPoint);
+    }
+
+    private void clearDockHighlights() {
+        for (DockSlotPanel slot : dockSlots.values()) {
+            slot.setHighlighted(false);
+        }
+    }
+
+    private void highlightDockTarget(String slotId) {
+        clearDockHighlights();
+        DockSlotPanel slot = dockSlots.get(slotId);
+        if (slot != null) {
+            slot.setHighlighted(true);
+        }
+    }
+
+    private DockSlotPanel findEmptySlot() {
+        for (DockSlotPanel slot : dockSlots.values()) {
+            if (slot.getSection() == null) {
+                return slot;
+            }
+        }
+        return null;
+    }
+
+    private String findSlotForSection(String sectionId) {
+        CollapsibleSection section = dockSections.get(sectionId);
+        if (section == null) {
+            return null;
+        }
+        for (DockSlotPanel slot : dockSlots.values()) {
+            if (slot.getSection() == section) {
+                return slot.getSlotId();
+            }
+        }
+        return null;
+    }
+
+    private String findSectionId(CollapsibleSection section) {
+        for (Map.Entry<String, CollapsibleSection> entry : dockSections.entrySet()) {
+            if (entry.getValue() == section) {
+                return entry.getKey();
+            }
+        }
+        return null;
+    }
+
+    private String slotDisplayName(String slotId) {
+        return switch (slotId) {
+            case "TOP_LEFT" -> "top left";
+            case "TOP_RIGHT" -> "top right";
+            case "BOTTOM_LEFT" -> "bottom left";
+            case "BOTTOM_RIGHT" -> "bottom right";
+            default -> slotId.toLowerCase(Locale.ROOT);
+        };
+    }
+
+    private void resetDockLayout() {
+        config.layoutTopLeftSection = "SERVER_SETTINGS";
+        config.layoutTopRightSection = "QUICK_ACTIONS";
+        config.layoutBottomLeftSection = "LIVE_CONSOLE";
+        config.layoutBottomRightSection = "PERFORMANCE_MONITOR";
+        config.layoutTopDivider = 620;
+        config.layoutBottomDivider = 620;
+        config.layoutVerticalDivider = 300;
+        config.compactPrioritySection = "SERVER_SETTINGS";
+        config.serverSettingsCollapsed = false;
+        config.quickActionsCollapsed = false;
+        config.consoleCollapsed = false;
+        config.performanceCollapsed = false;
+        responsiveCollapsedSections.clear();
+        currentLayoutMode = null;
+        applySavedDockLayout();
+        applyCollapsedStatesFromConfig();
+        if (compactPriorityCombo != null) {
+            compactPriorityCombo.setSelectedItem(labelForSectionId(config.compactPrioritySection));
+        }
+        handleResponsiveLayout();
+        appendLog("Layout reset to default.");
+    }
+
+    private void applyCollapsedStatesFromConfig() {
+        if (serverSettingsSection != null) {
+            serverSettingsSection.setCollapsed(config.serverSettingsCollapsed);
+        }
+        if (quickActionsSection != null) {
+            quickActionsSection.setCollapsed(config.quickActionsCollapsed);
+        }
+        if (consoleSection != null) {
+            consoleSection.setCollapsed(config.consoleCollapsed);
+        }
+        if (performanceSection != null) {
+            performanceSection.setCollapsed(config.performanceCollapsed);
+        }
+    }
+
+    private void handleResponsiveLayout() {
+        if (frame == null || dockLayoutContainer == null) {
+            return;
+        }
+        ResponsiveLayoutPlan plan = buildResponsiveLayoutPlan();
+        if (plan == null) {
+            return;
+        }
+        if (plan.mode() == currentLayoutMode
+                && responsiveCollapsedSections.equals(new LinkedHashSet<>(plan.overflowSectionIds()))
+                && currentResponsiveVisibleSectionIds.equals(plan.visibleSectionIds())) {
+            return;
+        }
+        currentLayoutMode = plan.mode();
+        rebuildResponsiveDockLayout(plan);
+    }
+
+    private boolean isSectionFloating(String sectionId) {
+        JDialog dialog = floatingSectionDialogs.get(sectionId);
+        return dialog != null && dialog.isDisplayable();
+    }
+
+    private ResponsiveLayoutPlan buildResponsiveLayoutPlan() {
+        if (frame == null || dockLayoutContainer == null) {
+            return null;
+        }
+        List<String> dockedSectionIds = getDockedSectionIdsInSlotOrder();
+        if (dockedSectionIds.isEmpty()) {
+            responsiveCollapsedSections.clear();
+            currentResponsiveVisibleSectionIds.clear();
+            return new ResponsiveLayoutPlan(LayoutMode.ONE_WIDE, List.of(), List.of());
+        }
+
+        int availableWidth = dockLayoutContainer.getWidth() > 0 ? dockLayoutContainer.getWidth() : frame.getContentPane().getWidth();
+        int availableHeight = dockLayoutContainer.getHeight() > 0 ? dockLayoutContainer.getHeight() : frame.getContentPane().getHeight();
+        availableWidth = Math.max(1, availableWidth);
+        availableHeight = Math.max(1, availableHeight);
+        String preferredSectionId = chooseDockedPriorityFallback(resolveCompactPrioritySection(), dockedSectionIds);
+        List<String> prioritizedSectionIds = prioritizeSectionIds(dockedSectionIds, preferredSectionId);
+
+        for (int visibleCount = prioritizedSectionIds.size(); visibleCount >= 1; visibleCount--) {
+            LayoutMode mode = chooseResponsiveMode(visibleCount, availableWidth, availableHeight);
+            if (mode != null) {
+                List<String> visible = new ArrayList<>(prioritizedSectionIds.subList(0, visibleCount));
+                List<String> overflow = new ArrayList<>(prioritizedSectionIds.subList(visibleCount, prioritizedSectionIds.size()));
+                return new ResponsiveLayoutPlan(mode, visible, overflow);
+            }
+        }
+        return new ResponsiveLayoutPlan(LayoutMode.ONE_WIDE, List.of(preferredSectionId), prioritizedSectionIds.stream().filter(id -> !id.equals(preferredSectionId)).toList());
+    }
+
+    private LayoutMode chooseResponsiveMode(int panelCount, int availableWidth, int availableHeight) {
+        double aspectRatio = availableHeight <= 0 ? 1.0 : (double) availableWidth / (double) availableHeight;
+        List<LayoutMode> candidates = new ArrayList<>();
+        if (panelCount >= 4 && availableWidth >= (MIN_PANEL_WIDTH * 2) && availableHeight >= (MIN_PANEL_HEIGHT * 2) && aspectRatio > 0.75 && aspectRatio < 1.45) {
+            candidates.add(LayoutMode.TWO_BY_TWO);
+        }
+        if (aspectRatio >= 1.2) {
+            addWideCandidates(candidates, panelCount);
+            addTallCandidates(candidates, panelCount);
+        } else if (aspectRatio <= 0.85) {
+            addTallCandidates(candidates, panelCount);
+            addWideCandidates(candidates, panelCount);
+        } else {
+            addWideCandidates(candidates, panelCount);
+            addTallCandidates(candidates, panelCount);
+        }
+        for (LayoutMode mode : candidates) {
+            if (canFitMode(mode, panelCount, availableWidth, availableHeight)) {
+                return mode;
+            }
+        }
+        return null;
+    }
+
+    private void addWideCandidates(List<LayoutMode> candidates, int panelCount) {
+        if (panelCount >= 4) {
+            candidates.add(LayoutMode.FOUR_WIDE);
+        }
+        if (panelCount >= 3) {
+            candidates.add(LayoutMode.THREE_WIDE);
+        }
+        if (panelCount >= 2) {
+            candidates.add(LayoutMode.TWO_WIDE);
+        }
+        candidates.add(LayoutMode.ONE_WIDE);
+    }
+
+    private void addTallCandidates(List<LayoutMode> candidates, int panelCount) {
+        if (panelCount >= 4) {
+            candidates.add(LayoutMode.FOUR_TALL);
+        }
+        if (panelCount >= 3) {
+            candidates.add(LayoutMode.THREE_TALL);
+        }
+        if (panelCount >= 2) {
+            candidates.add(LayoutMode.TWO_TALL);
+        }
+        candidates.add(LayoutMode.ONE_TALL);
+    }
+
+    private boolean canFitMode(LayoutMode mode, int panelCount, int availableWidth, int availableHeight) {
+        int columns = columnsForMode(mode, panelCount);
+        int rows = rowsForMode(mode, panelCount);
+        if (columns <= 0 || rows <= 0) {
+            return false;
+        }
+        int gap = 12;
+        int requiredWidth = (columns * MIN_PANEL_WIDTH) + ((columns - 1) * gap);
+        int requiredHeight = (rows * MIN_PANEL_HEIGHT) + ((rows - 1) * gap);
+        return availableWidth >= requiredWidth && availableHeight >= requiredHeight;
+    }
+
+    private void rebuildResponsiveDockLayout(ResponsiveLayoutPlan plan) {
+        responsiveLayoutApplying = true;
+        try {
+            responsiveCollapsedSections.clear();
+            responsiveCollapsedSections.addAll(plan.overflowSectionIds());
+            currentResponsiveVisibleSectionIds.clear();
+            currentResponsiveVisibleSectionIds.addAll(plan.visibleSectionIds());
+            rebuildCollapsedBar(plan.overflowSectionIds());
+
+            dockLayoutContainer.removeAll();
+            if (!plan.visibleSectionIds().isEmpty()) {
+                JPanel grid = new JPanel(new GridBagLayout());
+                markPanelTransparent(grid);
+                List<String> visibleIds = plan.visibleSectionIds();
+                int columns = columnsForMode(plan.mode(), visibleIds.size());
+                int rows = rowsForMode(plan.mode(), visibleIds.size());
+                for (int index = 0; index < visibleIds.size(); index++) {
+                    String sectionId = visibleIds.get(index);
+                    DockSlotPanel slot = dockSlots.get(findSlotForSection(sectionId));
+                    if (slot == null) {
+                        continue;
+                    }
+                    GridBagConstraints gbc = createResponsiveCellConstraints(index, columns, rows, plan.mode(), visibleIds.size());
+                    grid.add(slot, gbc);
+                }
+                dockLayoutContainer.add(grid, BorderLayout.CENTER);
+            }
+        } finally {
+            responsiveLayoutApplying = false;
+        }
+        dockLayoutContainer.revalidate();
+        dockLayoutContainer.repaint();
+        frame.revalidate();
+        frame.repaint();
+    }
+
+    private GridBagConstraints createResponsiveCellConstraints(int index, int columns, int rows, LayoutMode mode, int panelCount) {
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(6, 6, 6, 6);
+        gbc.fill = GridBagConstraints.BOTH;
+        gbc.weightx = 1;
+        gbc.weighty = 1;
+        if (mode == LayoutMode.TWO_BY_TWO || mode.name().endsWith("_WIDE")) {
+            gbc.gridx = index % columns;
+            gbc.gridy = index / columns;
+        } else {
+            int actualRows = Math.max(1, rows);
+            gbc.gridx = index / actualRows;
+            gbc.gridy = index % actualRows;
+        }
+        return gbc;
+    }
+
+    private void rebuildCollapsedBar(List<String> overflowSectionIds) {
+        overflowSectionButtons.clear();
+        for (String sectionId : overflowSectionIds) {
+            overflowSectionButtons.put(sectionId, createOverflowRestoreButton(sectionId));
+        }
+        refreshCollapsedBar();
+    }
+
+    private JButton createOverflowRestoreButton(String sectionId) {
+        RoundedButton button = createActionButton(labelForSectionId(sectionId), e -> showOverflowSection(sectionId));
+        button.setToolTipText("Show " + labelForSectionId(sectionId) + " in the main layout.");
+        return button;
+    }
+
+    private void showOverflowSection(String sectionId) {
+        config.compactPrioritySection = sectionId;
+        if (compactPriorityCombo != null) {
+            compactPriorityCombo.setSelectedItem(labelForSectionId(sectionId));
+        }
+        handleResponsiveLayout();
+    }
+
+    private void refreshCollapsedBar() {
+        if (collapsedBarPanel == null) {
+            return;
+        }
+        collapsedBarPanel.removeAll();
+        for (JButton button : collapsedSectionButtons.values()) {
+            collapsedBarPanel.add(button);
+        }
+        for (JButton button : overflowSectionButtons.values()) {
+            collapsedBarPanel.add(button);
+        }
+        collapsedBarPanel.setVisible(collapsedBarPanel.getComponentCount() > 0);
+        collapsedBarPanel.revalidate();
+        collapsedBarPanel.repaint();
+    }
+
+    private List<String> getDockedSectionIdsInSlotOrder() {
+        List<String> ordered = new ArrayList<>();
+        for (String slotId : List.of("TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT")) {
+            DockSlotPanel slot = dockSlots.get(slotId);
+            if (slot != null && slot.getSection() != null) {
+                String sectionId = findSectionId(slot.getSection());
+                if (sectionId != null && !isSectionFloating(sectionId) && !slot.getSection().isCollapsed()) {
+                    ordered.add(sectionId);
+                }
+            }
+        }
+        return ordered;
+    }
+
+    private List<String> prioritizeSectionIds(List<String> sectionIds, String prioritySectionId) {
+        List<String> ordered = new ArrayList<>(sectionIds);
+        if (ordered.remove(prioritySectionId)) {
+            ordered.add(0, prioritySectionId);
+        }
+        return ordered;
+    }
+
+    private int columnsForMode(LayoutMode mode, int panelCount) {
+        return switch (mode) {
+            case FOUR_WIDE -> Math.min(4, panelCount);
+            case THREE_WIDE -> Math.min(3, panelCount);
+            case TWO_WIDE, TWO_BY_TWO -> Math.min(2, panelCount);
+            case ONE_WIDE -> 1;
+            case FOUR_TALL -> Math.max(1, (int) Math.ceil((double) panelCount / Math.min(4, panelCount)));
+            case THREE_TALL -> Math.max(1, (int) Math.ceil((double) panelCount / Math.min(3, panelCount)));
+            case TWO_TALL -> Math.max(1, (int) Math.ceil((double) panelCount / Math.min(2, panelCount)));
+            case ONE_TALL -> panelCount;
+        };
+    }
+
+    private int rowsForMode(LayoutMode mode, int panelCount) {
+        return switch (mode) {
+            case FOUR_WIDE -> Math.max(1, (int) Math.ceil((double) panelCount / Math.min(4, panelCount)));
+            case THREE_WIDE -> Math.max(1, (int) Math.ceil((double) panelCount / Math.min(3, panelCount)));
+            case TWO_WIDE, TWO_BY_TWO -> Math.max(1, (int) Math.ceil((double) panelCount / 2d));
+            case ONE_WIDE -> panelCount;
+            case FOUR_TALL -> Math.min(4, panelCount);
+            case THREE_TALL -> Math.min(3, panelCount);
+            case TWO_TALL -> Math.min(2, panelCount);
+            case ONE_TALL -> 1;
+        };
+    }
+
+    private String chooseDockedPriorityFallback(String preferredSectionId, List<String> dockedSectionIds) {
+        if (dockedSectionIds.contains(preferredSectionId)) {
+            return preferredSectionId;
+        }
+        return dockedSectionIds.isEmpty() ? preferredSectionId : dockedSectionIds.get(0);
     }
 
     private CollapsibleSection createSectionPanel(String title, JComponent content, boolean collapsible) {
@@ -694,6 +1356,21 @@ public class Main {
         return scrollPane;
     }
 
+    private JScrollPane wrapPanelInScrollPaneIfNeeded(JComponent component) {
+        JScrollPane scrollPane = createWrappedScrollPane(component);
+        scrollPane.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+        scrollPane.getVerticalScrollBar().setUnitIncrement(18);
+        return scrollPane;
+    }
+
+    private JScrollPane wrapServerSettingsInScrollPane(JComponent component) {
+        JScrollPane scrollPane = wrapPanelInScrollPaneIfNeeded(component);
+        scrollPane.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED);
+        scrollPane.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+        scrollPane.getViewport().setScrollMode(JViewport.BLIT_SCROLL_MODE);
+        return scrollPane;
+    }
+
     private void addLabeledRow(JPanel panel, GridBagConstraints gbc, int row, String label, JTextField field, JButton button) {
         gbc.gridy = row;
         gbc.gridx = 0;
@@ -708,6 +1385,10 @@ public class Main {
         if (button != null && button.getToolTipText() == null) {
             button.setToolTipText(tooltip);
         }
+        if (button != null) {
+            lockButtonWidth(button, Math.max(90, button.getPreferredSize().width));
+        }
+        field.setMinimumSize(new Dimension(140, field.getPreferredSize().height));
         panel.add(sectionLabel, gbc);
         gbc.gridx = 1;
         gbc.weightx = 1;
@@ -742,6 +1423,19 @@ public class Main {
         return label;
     }
 
+    private void configureResizableField(JTextField field, int columns) {
+        field.setColumns(columns);
+        field.setMinimumSize(new Dimension(140, field.getPreferredSize().height));
+    }
+
+    private void lockButtonWidth(AbstractButton button, int width) {
+        Dimension preferred = button.getPreferredSize();
+        Dimension fixed = new Dimension(width, preferred.height);
+        button.setPreferredSize(fixed);
+        button.setMinimumSize(fixed);
+        button.setMaximumSize(new Dimension(width, preferred.height));
+    }
+
     private String tooltipForSetting(String label) {
         return switch (label) {
             case "Server Folder" -> "The main folder that contains your Minecraft server files.";
@@ -759,6 +1453,7 @@ public class Main {
         return switch (label) {
             case "Theme" -> "Choose whether the app matches Windows, uses dark mode, light mode, or your own custom colors.";
             case "Close Button" -> "Choose what happens when you close the manager window.";
+            case "Preferred section when space is limited" -> "Choose which major panel should stay most visible when the window is too small.";
             case "Custom Background" -> "Pick the main background color when using the custom theme.";
             case "Custom Inputs" -> "Pick the color used for text boxes and console areas in the custom theme.";
             case "Playit.gg Path" -> "Optional path to your Playit.gg executable for automatic startup.";
@@ -827,16 +1522,7 @@ public class Main {
             values.add(value);
         }
         JComboBox<Integer> comboBox = new JComboBox<>(values.toArray(Integer[]::new));
-        comboBox.setRenderer(new DefaultListCellRenderer() {
-            @Override
-            public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
-                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
-                if (value instanceof Integer seconds) {
-                    setText(seconds + " sec");
-                }
-                return this;
-            }
-        });
+        prepareComboBox(comboBox, value -> value instanceof Integer seconds ? seconds + " sec" : String.valueOf(value));
         Dimension preferred = comboBox.getPreferredSize();
         int targetHeight = Math.max(34, preferred.height + 8);
         comboBox.setPreferredSize(new Dimension(preferred.width, targetHeight));
@@ -847,16 +1533,7 @@ public class Main {
 
     private JComboBox<Integer> createPollingRateDropdown() {
         JComboBox<Integer> comboBox = new JComboBox<>(new Integer[]{1, 2, 5, 10, 15, 30});
-        comboBox.setRenderer(new DefaultListCellRenderer() {
-            @Override
-            public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
-                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
-                if (value instanceof Integer seconds) {
-                    setText(seconds + " sec");
-                }
-                return this;
-            }
-        });
+        prepareComboBox(comboBox, value -> value instanceof Integer seconds ? seconds + " sec" : String.valueOf(value));
         Dimension preferred = comboBox.getPreferredSize();
         int targetHeight = Math.max(34, preferred.height + 8);
         comboBox.setPreferredSize(new Dimension(preferred.width, targetHeight));
@@ -902,9 +1579,144 @@ public class Main {
     }
 
     private void saveServerSettings() {
+        AppConfig previous = copyConfig(config);
         configFromUi();
+        Path serverFolder = safePath(config.serverFolder);
+        ServerSetupDetector.DetectionResult detection = ServerSetupDetector.detect(
+                serverFolder,
+                serverFolder == null || config.jarFile == null || config.jarFile.isBlank() ? null : serverFolder.resolve(config.jarFile)
+        );
+        BackupService.BackupResult backupState = BackupService.inspectExistingBackup(serverFolder, detection);
+        List<String> changes = buildSettingsChangeSummary(previous, config, detection);
+        if (changes.isEmpty()) {
+            saveConfig(false);
+            appendLog("No server setting changes were detected.");
+            return;
+        }
+        if (!showConfirmApplySettingsDialog(changes, detection, backupState)) {
+            appendLog("Server setting changes were cancelled.");
+            return;
+        }
+        BackupService.BackupResult backupResult = BackupService.createManagedFileBackupIfMissing(serverFolder, detection);
+        if (!backupResult.exists() && !backupResult.managedFiles().isEmpty()) {
+            appendLog(backupResult.summary());
+            JOptionPane.showMessageDialog(frame,
+                    "The manager could not create a safety backup for the launch files it may change.\n\n" + backupResult.message(),
+                    "Backup Failed",
+                    JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        appendLog(backupResult.summary());
         saveConfig(true);
         appendLog("Server settings saved.");
+    }
+
+    private AppConfig copyConfig(AppConfig source) {
+        AppConfig copy = new AppConfig();
+        copy.themeMode = source.themeMode;
+        copy.closeBehavior = source.closeBehavior;
+        copy.customBackgroundColor = source.customBackgroundColor;
+        copy.customInputColor = source.customInputColor;
+        copy.settingsLocked = source.settingsLocked;
+        copy.serverSettingsCollapsed = source.serverSettingsCollapsed;
+        copy.quickActionsCollapsed = source.quickActionsCollapsed;
+        copy.consoleCollapsed = source.consoleCollapsed;
+        copy.performanceCollapsed = source.performanceCollapsed;
+        copy.commandCollapsed = source.commandCollapsed;
+        copy.layoutTopLeftSection = source.layoutTopLeftSection;
+        copy.layoutTopRightSection = source.layoutTopRightSection;
+        copy.layoutBottomLeftSection = source.layoutBottomLeftSection;
+        copy.layoutBottomRightSection = source.layoutBottomRightSection;
+        copy.layoutTopDivider = source.layoutTopDivider;
+        copy.layoutBottomDivider = source.layoutBottomDivider;
+        copy.layoutVerticalDivider = source.layoutVerticalDivider;
+        copy.compactPrioritySection = source.compactPrioritySection;
+        copy.checkPlayitBeforeStart = source.checkPlayitBeforeStart;
+        copy.startPlayitIfMissing = source.startPlayitIfMissing;
+        copy.playitExecutablePath = source.playitExecutablePath;
+        copy.monitoringEnabled = source.monitoringEnabled;
+        copy.monitorSystemCpu = source.monitorSystemCpu;
+        copy.monitorSystemMemory = source.monitorSystemMemory;
+        copy.monitorServerMemory = source.monitorServerMemory;
+        copy.monitorUptime = source.monitorUptime;
+        copy.monitorTps = source.monitorTps;
+        copy.monitorPlayerCount = source.monitorPlayerCount;
+        copy.monitorLatency = source.monitorLatency;
+        copy.monitoringPollingSeconds = source.monitoringPollingSeconds;
+        copy.profileName = source.profileName;
+        copy.serverFolder = source.serverFolder;
+        copy.jarFile = source.jarFile;
+        copy.javaPath = source.javaPath;
+        copy.xms = source.xms;
+        copy.xmx = source.xmx;
+        copy.jvmArgs = source.jvmArgs;
+        copy.serverArgs = source.serverArgs;
+        copy.autoRestartOnCrash = source.autoRestartOnCrash;
+        copy.startMinimized = source.startMinimized;
+        copy.minimizeToTray = source.minimizeToTray;
+        copy.autoRestartDelaySeconds = source.autoRestartDelaySeconds;
+        copy.safeStopWaitSeconds = source.safeStopWaitSeconds;
+        copy.windowWidth = source.windowWidth;
+        copy.windowHeight = source.windowHeight;
+        return copy;
+    }
+
+    private List<String> buildSettingsChangeSummary(AppConfig previous, AppConfig updated, ServerSetupDetector.DetectionResult detection) {
+        List<String> changes = new ArrayList<>();
+        addChange(changes, "Java path", previous.javaPath, updated.javaPath);
+        addChange(changes, "Server jar", previous.jarFile, updated.jarFile);
+        addChange(changes, "Xms", previous.xms, updated.xms);
+        addChange(changes, "Xmx", previous.xmx, updated.xmx);
+        addChange(changes, "JVM args", previous.jvmArgs, updated.jvmArgs);
+        addChange(changes, "Server args", previous.serverArgs, updated.serverArgs);
+        if (detectedJavaInfo.majorVersion() > 0 && detection.likelyRequiredJava() > 0 && detectedJavaInfo.majorVersion() < detection.likelyRequiredJava()) {
+            changes.add("Warning: configured Java may be too old. Java " + detectedJavaInfo.majorVersion() + " detected, likely need Java " + detection.likelyRequiredJava() + ".");
+        }
+        return changes;
+    }
+
+    private void addChange(List<String> changes, String label, String before, String after) {
+        String oldValue = before == null || before.isBlank() ? "(empty)" : before;
+        String newValue = after == null || after.isBlank() ? "(empty)" : after;
+        if (!oldValue.equals(newValue)) {
+            changes.add(label + ": " + oldValue + " -> " + newValue);
+        }
+    }
+
+    private boolean showConfirmApplySettingsDialog(List<String> changes, ServerSetupDetector.DetectionResult detection, BackupService.BackupResult backupState) {
+        JTextArea summaryArea = new JTextArea();
+        summaryArea.setEditable(false);
+        summaryArea.setLineWrap(true);
+        summaryArea.setWrapStyleWord(true);
+        String managedTarget = LaunchFileService.describeManagedTarget(safePath(config.serverFolder), detection);
+        StringBuilder builder = new StringBuilder();
+        builder.append("These changes will update your launch settings and may affect server startup.").append(System.lineSeparator()).append(System.lineSeparator());
+        builder.append("Detected loader: ").append(detection.serverType().displayName()).append(System.lineSeparator());
+        builder.append("Detected Minecraft version: ").append(detection.minecraftVersion() == null ? "Unknown" : detection.minecraftVersion()).append(System.lineSeparator());
+        builder.append("Likely Java requirement: ").append(detection.likelyRequiredJava() > 0 ? "Java " + detection.likelyRequiredJava() : "Unknown").append(System.lineSeparator());
+        builder.append("Configured Java: ").append(detectedJavaInfo.shortDisplay()).append(System.lineSeparator());
+        builder.append("Launch target to update: ").append(managedTarget).append(System.lineSeparator());
+        builder.append("Backup status: ")
+                .append(backupState.exists()
+                        ? "A backup already exists."
+                        : (backupState.managedFiles().isEmpty()
+                        ? "No app-managed launch file was detected, so only the internal manager config will be saved."
+                        : "A first-run backup will be created before applying changes."))
+                .append(System.lineSeparator());
+        if (backupState.backupFolder() != null) {
+            builder.append("Backup folder: ").append(backupState.backupFolder()).append(System.lineSeparator());
+        }
+        builder.append(System.lineSeparator());
+        builder.append("Changes to apply:").append(System.lineSeparator());
+        for (String change : changes) {
+            builder.append("- ").append(change).append(System.lineSeparator());
+        }
+        summaryArea.setText(builder.toString());
+        summaryArea.setCaretPosition(0);
+        JScrollPane scrollPane = new JScrollPane(summaryArea);
+        scrollPane.setPreferredSize(new Dimension(580, 320));
+        int result = JOptionPane.showConfirmDialog(frame, scrollPane, "Confirm Server Setting Changes", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
+        return result == JOptionPane.OK_OPTION;
     }
 
     private void browsePlayitExecutable() {
@@ -918,7 +1730,12 @@ public class Main {
     private void detectJavaRuntime(boolean applyToField) {
         configFromUi();
         Path serverFolder = safePath(config.serverFolder);
-        detectedJavaInfo = JavaDetectionService.detect(config.javaPath, serverFolder, config.jarFile, detectedServerType);
+        ServerSetupDetector.DetectionResult detection = ServerSetupDetector.detect(
+                serverFolder,
+                serverFolder == null || config.jarFile == null || config.jarFile.isBlank() ? null : serverFolder.resolve(config.jarFile)
+        );
+        updateDetectedType(detection);
+        detectedJavaInfo = JavaDetectionService.detect(config.javaPath, detection, serverFolder);
         if (applyToField && detectedJavaInfo.detectedPath() != null && !detectedJavaInfo.detectedPath().isBlank() && !settingsLocked) {
             javaField.setText(detectedJavaInfo.detectedPath());
         }
@@ -932,6 +1749,128 @@ public class Main {
             Desktop.getDesktop().browse(URI.create("https://adoptium.net/"));
         } catch (IOException e) {
             appendLog("Could not open Java download help: " + e.getMessage());
+        }
+    }
+
+    private boolean handleEulaBeforeStart() {
+        Path serverFolder = safePath(config.serverFolder);
+        EulaService.EulaStatus status = EulaService.detectEulaStatus(serverFolder);
+        appendLog(status.message());
+        return switch (status.state()) {
+            case ACCEPTED -> true;
+            case NOT_ACCEPTED -> showEulaRequiredDialog(status, eulaDeclinedThisSession);
+            case MISSING -> showEulaMissingDialog(status);
+            case UNKNOWN -> {
+                appendLog("EULA status is unclear. Review eula.txt before starting if the server reports an EULA error.");
+                yield true;
+            }
+        };
+    }
+
+    private boolean showEulaRequiredDialog(EulaService.EulaStatus status, boolean repeatedPrompt) {
+        if (eulaPromptOpen) {
+            return false;
+        }
+        eulaPromptOpen = true;
+        try {
+            String title = "Minecraft EULA Required";
+            String message = repeatedPrompt
+                    ? "This server still cannot start because the Minecraft EULA has not been accepted.\n\n"
+                    + "The server requires eula=true in eula.txt before it can run.\n"
+                    + "Agreeing now will update eula.txt to eula=true."
+                    : "Minecraft servers require accepting Mojang/Microsoft's EULA before startup can continue.\n\n"
+                    + "Agreeing will update eula.txt to eula=true.\n"
+                    + "Disagreeing will leave the file unchanged.";
+            while (true) {
+                Object[] options = {"Agree", repeatedPrompt ? "Cancel" : "Disagree", "Open EULA Link"};
+                int result = JOptionPane.showOptionDialog(
+                        frame,
+                        message,
+                        title,
+                        JOptionPane.DEFAULT_OPTION,
+                        JOptionPane.WARNING_MESSAGE,
+                        null,
+                        options,
+                        options[0]
+                );
+                if (result == 0) {
+                    EulaService.WriteResult writeResult = EulaService.writeEulaAccepted(safePath(config.serverFolder));
+                    appendLog(writeResult.message());
+                    if (writeResult.success()) {
+                        eulaDeclinedThisSession = false;
+                        appendLog("EULA accepted by user; updated eula.txt.");
+                        return true;
+                    }
+                    JOptionPane.showMessageDialog(frame,
+                            "The manager could not update eula.txt automatically.\n\n" + writeResult.message(),
+                            "EULA Update Failed",
+                            JOptionPane.ERROR_MESSAGE);
+                    return false;
+                }
+                if (result == 1 || result == JOptionPane.CLOSED_OPTION) {
+                    eulaDeclinedThisSession = true;
+                    appendLog("EULA not accepted; startup blocked.");
+                    return false;
+                }
+                if (result == 2) {
+                    openMinecraftEulaLink();
+                }
+            }
+        } finally {
+            eulaPromptOpen = false;
+        }
+    }
+
+    private boolean showEulaMissingDialog(EulaService.EulaStatus status) {
+        Object[] options = {"Continue", "Cancel", "Open EULA Link"};
+        String message = "No eula.txt file was found in this server folder yet.\n\n"
+                + "Many Minecraft servers create eula.txt on the first run.\n"
+                + "The server still cannot fully start until that file contains eula=true.\n"
+                + "If startup reports an EULA error, the manager will prompt you again.";
+        while (true) {
+            int result = JOptionPane.showOptionDialog(
+                    frame,
+                    message,
+                    "Minecraft EULA May Be Required",
+                    JOptionPane.DEFAULT_OPTION,
+                    JOptionPane.INFORMATION_MESSAGE,
+                    null,
+                    options,
+                    options[0]
+            );
+            if (result == 0) {
+                appendLog("No eula.txt file was found yet. Allowing startup so the server can generate it if needed.");
+                return true;
+            }
+            if (result == 1 || result == JOptionPane.CLOSED_OPTION) {
+                appendLog("Startup cancelled while EULA status was still missing.");
+                return false;
+            }
+            if (result == 2) {
+                openMinecraftEulaLink();
+            }
+        }
+    }
+
+    private void handleEulaErrorFromLog(String line) {
+        if (eulaPromptOpen) {
+            return;
+        }
+        appendLog("Server reported EULA error during startup.");
+        SwingUtilities.invokeLater(() -> {
+            EulaService.EulaStatus status = EulaService.detectEulaStatus(safePath(config.serverFolder));
+            boolean accepted = showEulaRequiredDialog(status, eulaDeclinedThisSession);
+            if (!accepted) {
+                appendLog("The server still cannot start because the Minecraft EULA has not been accepted.");
+            }
+        });
+    }
+
+    private void openMinecraftEulaLink() {
+        try {
+            Desktop.getDesktop().browse(URI.create("https://aka.ms/MinecraftEULA"));
+        } catch (IOException e) {
+            appendLog("Could not open the Minecraft EULA link: " + e.getMessage());
         }
     }
 
@@ -976,7 +1915,7 @@ public class Main {
 
         ServerSetupDetector.DetectionResult detection = ServerSetupDetector.detect(serverFolder, jarPath);
         Path launchFile = LaunchFileService.detectPrimaryLaunchFile(serverFolder);
-        updateDetectedType(detection.serverType());
+        updateDetectedType(detection);
 
         if (launchFile != null) {
             appendLog("Detected custom " + launchFile.getFileName() + ".");
@@ -1019,15 +1958,27 @@ public class Main {
         } else if (detection.xms() != null || detection.xmx() != null) {
             appendLog("Detected memory settings, but kept your current Xms/Xmx values.");
         }
+        if (detection.versionSource() != null && !detection.versionSource().isBlank()) {
+            appendLog("Minecraft version detection source: " + detection.versionSource() + ".");
+        }
         appendLog("Detected server type: " + detection.serverType().displayName());
         updateJvmRecommendation();
         detectJavaRuntime(false);
     }
 
-    private void updateDetectedType(ServerSetupDetector.ServerType serverType) {
-        detectedServerType = serverType != null ? serverType : ServerSetupDetector.ServerType.UNKNOWN;
+    private void updateDetectedType(ServerSetupDetector.DetectionResult detection) {
+        detectedServerType = detection != null && detection.serverType() != null ? detection.serverType() : ServerSetupDetector.ServerType.UNKNOWN;
         if (detectedTypeLabel != null) {
             detectedTypeLabel.setText("Detected Type: " + detectedServerType.displayName());
+        }
+        if (detectedVersionLabel != null) {
+            detectedVersionLabel.setText("Minecraft Version: " + (detection != null && detection.minecraftVersion() != null ? detection.minecraftVersion() : "Unknown"));
+        }
+        if (perfTypeLabel != null) {
+            perfTypeLabel.setText("Server Type: " + detectedServerType.displayName());
+        }
+        if (perfVersionLabel != null) {
+            perfVersionLabel.setText("Minecraft Version: " + (detection != null && detection.minecraftVersion() != null ? detection.minecraftVersion() : "Unknown"));
         }
     }
 
@@ -1130,23 +2081,21 @@ public class Main {
             monitorTpsBox.setSelected(config.monitorTps);
             monitorPlayerCountBox.setSelected(config.monitorPlayerCount);
             monitorLatencyBox.setSelected(config.monitorLatency);
-            monitorJavaStatusBox.setSelected(config.monitorJavaStatus);
-            monitorServerTypeBox.setSelected(config.monitorServerType);
-            monitorRestartStateBox.setSelected(config.monitorRestartState);
             monitoringRateCombo.setSelectedItem(nearestPollingRate(config.monitoringPollingSeconds));
+        }
+        if (compactPriorityCombo != null) {
+            compactPriorityCombo.setSelectedItem(labelForSectionId(resolveCompactPrioritySection()));
         }
         updateThemeControlState();
         updateMonitoringControls();
         setSettingsLocked(config.settingsLocked);
-        if (serverSettingsSection != null) serverSettingsSection.setCollapsed(config.serverSettingsCollapsed);
-        if (sidebarSection != null) sidebarSection.setCollapsed(config.sidebarCollapsed);
-        if (consoleSection != null) consoleSection.setCollapsed(config.consoleCollapsed);
-        if (commandSection != null) commandSection.setCollapsed(config.commandCollapsed);
+        applyCollapsedStatesFromConfig();
+        handleResponsiveLayout();
         Path configFolder = safePath(config.serverFolder);
         updateDetectedType(ServerSetupDetector.detect(
                 configFolder,
                 configFolder == null || config.jarFile == null || config.jarFile.isBlank() ? null : configFolder.resolve(config.jarFile)
-        ).serverType());
+        ));
         detectJavaRuntime(false);
         updateJvmRecommendation();
     }
@@ -1168,6 +2117,7 @@ public class Main {
         config.closeBehavior = getSelectedCloseBehavior();
         config.customBackgroundColor = toHex(customBackgroundColor);
         config.customInputColor = toHex(customInputColor);
+        config.compactPrioritySection = getSelectedCompactPrioritySection();
         config.checkPlayitBeforeStart = playitCheckBox != null && playitCheckBox.isSelected();
         config.startPlayitIfMissing = playitStartBox != null && playitStartBox.isSelected();
         config.playitExecutablePath = playitPathField != null ? playitPathField.getText().trim() : "";
@@ -1179,16 +2129,17 @@ public class Main {
         config.monitorTps = monitorTpsBox != null && monitorTpsBox.isSelected();
         config.monitorPlayerCount = monitorPlayerCountBox != null && monitorPlayerCountBox.isSelected();
         config.monitorLatency = monitorLatencyBox != null && monitorLatencyBox.isSelected();
-        config.monitorJavaStatus = monitorJavaStatusBox == null || monitorJavaStatusBox.isSelected();
-        config.monitorServerType = monitorServerTypeBox == null || monitorServerTypeBox.isSelected();
-        config.monitorRestartState = monitorRestartStateBox == null || monitorRestartStateBox.isSelected();
         config.monitoringPollingSeconds = selectedDelay(monitoringRateCombo, 2);
         config.minimizeToTray = CLOSE_TO_TRAY.equals(config.closeBehavior);
         config.settingsLocked = settingsLocked;
-        config.serverSettingsCollapsed = serverSettingsSection != null && serverSettingsSection.isCollapsed();
-        config.sidebarCollapsed = sidebarSection != null && sidebarSection.isCollapsed();
-        config.consoleCollapsed = consoleSection != null && consoleSection.isCollapsed();
-        config.commandCollapsed = commandSection != null && commandSection.isCollapsed();
+        config.serverSettingsCollapsed = serverSettingsSection != null && serverSettingsSection.isCollapsed() && !responsiveCollapsedSections.contains("SERVER_SETTINGS");
+        config.quickActionsCollapsed = quickActionsSection != null && quickActionsSection.isCollapsed() && !responsiveCollapsedSections.contains("QUICK_ACTIONS");
+        config.consoleCollapsed = consoleSection != null && consoleSection.isCollapsed() && !responsiveCollapsedSections.contains("LIVE_CONSOLE");
+        config.performanceCollapsed = performanceSection != null && performanceSection.isCollapsed() && !responsiveCollapsedSections.contains("PERFORMANCE_MONITOR");
+        config.commandCollapsed = false;
+        if (!responsiveLayoutApplying) {
+            captureDockLayout();
+        }
     }
 
     private void updateThemeControlState() {
@@ -1207,13 +2158,14 @@ public class Main {
         }
         configFromUi();
         ThemePalette palette = createThemePalette();
+        applyThemeDefaults(palette);
         applyThemeToComponent(frame.getContentPane(), palette);
         frame.getContentPane().setBackground(palette.windowBackground);
         if (optionsDialog != null) {
             applyThemeToDialog(optionsDialog, palette);
         }
-        if (performanceDialog != null) {
-            applyThemeToDialog(performanceDialog, palette);
+        for (JDialog dialog : floatingSectionDialogs.values()) {
+            applyThemeToDialog(dialog, palette);
         }
         frame.repaint();
     }
@@ -1274,10 +2226,7 @@ public class Main {
             }
         }
         if (component instanceof JComboBox<?> comboBox) {
-            comboBox.setOpaque(true);
-            comboBox.setBackground(palette.inputBackground);
-            comboBox.setForeground(contrastColor(palette.inputBackground));
-            comboBox.setBorder(createRoundedInputBorder(palette.borderColor));
+            themeComboBox(comboBox, palette);
         }
         if (component instanceof JSpinner spinner) {
             spinner.setOpaque(true);
@@ -1314,6 +2263,73 @@ public class Main {
 
     private Border createRoundedInputBorder(Color borderColor) {
         return new CompoundBorder(new RoundedBorder(borderColor, 12), new EmptyBorder(6, 10, 6, 10));
+    }
+
+    private void applyThemeDefaults(ThemePalette palette) {
+        Color inputText = contrastColor(palette.inputBackground);
+        Color selectedBackground = mix(palette.buttonBackground, palette.inputBackground, 0.25f);
+        Color selectedText = contrastColor(selectedBackground);
+        Color disabledBackground = mix(palette.inputBackground, palette.windowBackground, 0.45f);
+        Color disabledText = mix(inputText, palette.windowBackground, 0.45f);
+        UIManager.put("ComboBox.background", palette.inputBackground);
+        UIManager.put("ComboBox.foreground", inputText);
+        UIManager.put("ComboBox.selectionBackground", selectedBackground);
+        UIManager.put("ComboBox.selectionForeground", selectedText);
+        UIManager.put("ComboBox.disabledBackground", disabledBackground);
+        UIManager.put("ComboBox.disabledForeground", disabledText);
+        UIManager.put("List.background", palette.inputBackground);
+        UIManager.put("List.foreground", inputText);
+        UIManager.put("List.selectionBackground", selectedBackground);
+        UIManager.put("List.selectionForeground", selectedText);
+    }
+
+    private void prepareComboBox(JComboBox<?> comboBox, ComboItemFormatter formatter) {
+        comboBox.putClientProperty("mcmanager.comboFormatter", formatter);
+    }
+
+    private void themeComboBox(JComboBox<?> comboBox, ThemePalette palette) {
+        Color inputText = contrastColor(palette.inputBackground);
+        Color disabledBackground = mix(palette.inputBackground, palette.windowBackground, 0.45f);
+        Color selectedBackground = mix(palette.buttonBackground, palette.inputBackground, 0.25f);
+        comboBox.setOpaque(true);
+        comboBox.setBackground(comboBox.isEnabled() ? palette.inputBackground : disabledBackground);
+        comboBox.setForeground(comboBox.isEnabled() ? inputText : mix(inputText, palette.windowBackground, 0.45f));
+        comboBox.setBorder(createRoundedInputBorder(palette.borderColor));
+        comboBox.setRenderer(createThemedComboRenderer(comboBox, palette, selectedBackground));
+    }
+
+    private ListCellRenderer<Object> createThemedComboRenderer(JComboBox<?> comboBox, ThemePalette palette, Color selectedBackground) {
+        ComboItemFormatter formatter = comboFormatterFor(comboBox);
+        Color inputText = contrastColor(palette.inputBackground);
+        Color disabledBackground = mix(palette.inputBackground, palette.windowBackground, 0.45f);
+        Color disabledText = mix(inputText, palette.windowBackground, 0.45f);
+        Color selectedText = contrastColor(selectedBackground);
+        return new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                setText(formatter.format(value));
+                if (!comboBox.isEnabled()) {
+                    setBackground(disabledBackground);
+                    setForeground(disabledText);
+                } else if (isSelected) {
+                    setBackground(selectedBackground);
+                    setForeground(selectedText);
+                } else {
+                    setBackground(palette.inputBackground);
+                    setForeground(inputText);
+                }
+                return this;
+            }
+        };
+    }
+
+    private ComboItemFormatter comboFormatterFor(JComboBox<?> comboBox) {
+        Object formatter = comboBox.getClientProperty("mcmanager.comboFormatter");
+        if (formatter instanceof ComboItemFormatter comboFormatter) {
+            return comboFormatter;
+        }
+        return value -> value == null ? "" : value.toString();
     }
 
     private void markPanelTransparent(JPanel panel) {
@@ -1360,8 +2376,11 @@ public class Main {
         if (!validateConfig()) {
             return;
         }
+        if (!handleEulaBeforeStart()) {
+            return;
+        }
         ensurePlayitBeforeStart();
-        saveConfig(true);
+        saveConfig(false);
         try {
             serverManager.start(config);
         } catch (Exception ex) {
@@ -1436,6 +2455,12 @@ public class Main {
         if (perfStatusLabel == null) {
             return;
         }
+        perfStatusLabel.setText("Status: " + serverManager.getState().name());
+        perfRestartLabel.setText(getRestartStateText());
+        perfTypeLabel.setText("Server Type: " + detectedServerType.displayName());
+        perfVersionLabel.setText("Minecraft Version: " + (detectedVersionLabel != null ? detectedVersionLabel.getText().replace("Minecraft Version: ", "") : "Unknown"));
+        perfJavaLabel.setText("Java: " + detectedJavaInfo.shortDisplay());
+
         if (!config.monitoringEnabled) {
             setMonitoringDisabledMessage("Monitoring is disabled in Options.");
             return;
@@ -1445,18 +2470,9 @@ public class Main {
             return;
         }
 
-        perfStatusLabel.setText("Status: " + serverManager.getState().name());
         perfUptimeLabel.setText(config.monitorUptime ? "Uptime: " + formatDuration(serverManager.getUptimeMillis()) : "Uptime: Disabled");
-        perfRestartLabel.setText(config.monitorRestartState
-                ? (serverManager.isRestartPending()
-                ? "Restart: Crash restart scheduled in " + serverManager.getPendingRestartSeconds() + " sec"
-                : "Restart: " + serverManager.getLastRestartReason())
-                : "Restart: Disabled");
-        perfTypeLabel.setText(config.monitorServerType ? "Server Type: " + detectedServerType.displayName() : "Server Type: Disabled");
-        perfJavaLabel.setText(config.monitorJavaStatus ? "Java: " + detectedJavaInfo.shortDisplay() : "Java: Disabled");
         perfServerMemoryLabel.setText(config.monitorServerMemory
-                ? "Server Memory: Xms " + formatMemoryValue(xmsField != null ? xmsField.getText().trim() : "")
-                + " / Xmx " + formatMemoryValue(xmxField != null ? xmxField.getText().trim() : "")
+                ? formatServerMemoryText(serverManager.getProcessMemoryBytes())
                 : "Server Memory: Disabled");
 
         if (config.monitorTps || config.monitorPlayerCount || config.monitorLatency) {
@@ -1509,13 +2525,14 @@ public class Main {
     private void setMonitoringDisabledMessage(String message) {
         perfStatusLabel.setText("Status: " + serverManager.getState().name());
         perfUptimeLabel.setText(message);
-        perfRestartLabel.setText("Restart: " + (config.monitorRestartState ? serverManager.getLastRestartReason() : "Disabled"));
+        perfRestartLabel.setText(getRestartStateText());
         perfSystemCpuLabel.setText("System CPU: Paused");
         perfSystemMemoryLabel.setText("System Memory: Paused");
         perfServerMemoryLabel.setText("Server Memory: Paused");
         perfServerCpuLabel.setText("Server CPU Time: Paused");
-        perfJavaLabel.setText("Java: " + (config.monitorJavaStatus ? detectedJavaInfo.shortDisplay() : "Disabled"));
-        perfTypeLabel.setText("Server Type: " + (config.monitorServerType ? detectedServerType.displayName() : "Disabled"));
+        perfJavaLabel.setText("Java: " + detectedJavaInfo.shortDisplay());
+        perfTypeLabel.setText("Server Type: " + detectedServerType.displayName());
+        perfVersionLabel.setText("Minecraft Version: " + (detectedVersionLabel != null ? detectedVersionLabel.getText().replace("Minecraft Version: ", "") : "Unknown"));
         perfPlayersLabel.setText("Players/TPS: Paused");
     }
 
@@ -1556,8 +2573,7 @@ public class Main {
         boolean enabled = monitoringEnabledBox != null && monitoringEnabledBox.isSelected();
         for (JComponent component : List.of(
                 monitorSystemCpuBox, monitorSystemMemoryBox, monitorServerMemoryBox, monitorUptimeBox,
-                monitorTpsBox, monitorPlayerCountBox, monitorLatencyBox, monitorJavaStatusBox,
-                monitorServerTypeBox, monitorRestartStateBox, monitoringRateCombo)) {
+                monitorTpsBox, monitorPlayerCountBox, monitorLatencyBox, monitoringRateCombo)) {
             if (component != null) {
                 component.setEnabled(enabled);
             }
@@ -1577,6 +2593,41 @@ public class Main {
 
     private String formatMemoryValue(String value) {
         return value == null || value.isBlank() ? "not set" : value;
+    }
+
+    private String formatServerMemoryText(long processBytes) {
+        if (!serverManager.isRunning()) {
+            return "Server Memory: Offline";
+        }
+        if (processBytes < 0L) {
+            return "Server Memory: Unavailable";
+        }
+        String xmxValue = xmxField != null ? xmxField.getText().trim() : "";
+        if (xmxValue.isBlank()) {
+            return "Server Memory: " + formatBytes(processBytes) + " process memory";
+        }
+        return "Server Memory: " + formatBytes(processBytes) + " process memory / Xmx " + xmxValue;
+    }
+
+    private String formatBytes(long bytes) {
+        double value = bytes;
+        String[] units = {"B", "KB", "MB", "GB"};
+        int unitIndex = 0;
+        while (value >= 1024 && unitIndex < units.length - 1) {
+            value /= 1024d;
+            unitIndex++;
+        }
+        return unitIndex == 0 ? ((long) value) + " " + units[unitIndex] : String.format("%.1f %s", value, units[unitIndex]);
+    }
+
+    private String getRestartStateText() {
+        return switch (serverManager.getRestartDisplayState()) {
+            case DISABLED -> "Restart: Disabled";
+            case SCHEDULED -> "Restart in: " + serverManager.getPendingRestartSeconds() + " sec";
+            case RESTARTING_NOW -> "Restart: Restarting now";
+            case CANCELED -> "Restart: Canceled";
+            case NONE_PENDING -> "Restart: None pending";
+        };
     }
 
     private boolean validateConfig() {
@@ -1662,6 +2713,9 @@ public class Main {
             if (consolePreviewArea != null) {
                 consolePreviewArea.setText(getLastConsoleLines(3));
                 consolePreviewArea.setCaretPosition(consolePreviewArea.getDocument().getLength());
+            }
+            if (EulaService.detectEulaErrorFromLogLine(line)) {
+                handleEulaErrorFromLog(line);
             }
         });
     }
@@ -1812,6 +2866,37 @@ public class Main {
         };
     }
 
+    private String resolveCompactPrioritySection() {
+        return config.compactPrioritySection == null || config.compactPrioritySection.isBlank()
+                ? "SERVER_SETTINGS"
+                : config.compactPrioritySection;
+    }
+
+    private String getSelectedCompactPrioritySection() {
+        if (compactPriorityCombo == null || compactPriorityCombo.getSelectedItem() == null) {
+            return resolveCompactPrioritySection();
+        }
+        return sectionIdForLabel(compactPriorityCombo.getSelectedItem().toString());
+    }
+
+    private String labelForSectionId(String sectionId) {
+        return switch (sectionId) {
+            case "QUICK_ACTIONS" -> "Quick Actions";
+            case "LIVE_CONSOLE" -> "Live Console";
+            case "PERFORMANCE_MONITOR" -> "Performance Monitor";
+            default -> "Server Settings";
+        };
+    }
+
+    private String sectionIdForLabel(String label) {
+        return switch (label) {
+            case "Quick Actions" -> "QUICK_ACTIONS";
+            case "Live Console" -> "LIVE_CONSOLE";
+            case "Performance Monitor" -> "PERFORMANCE_MONITOR";
+            default -> "SERVER_SETTINGS";
+        };
+    }
+
     private Color parseColor(String value, Color fallback) {
         try {
             return value == null || value.isBlank() ? fallback : Color.decode(value);
@@ -1865,9 +2950,12 @@ public class Main {
     private static class CollapsibleSection extends RoundedPanel {
         private final JLabel titleLabel;
         private final RoundedButton toggleButton;
+        private final JPanel headerPanel;
+        private final JPanel headerActionsPanel;
         private final JComponent content;
         private final JComponent collapsedPreview;
         private final boolean collapsible;
+        private Consumer<Boolean> toggleHandler;
         private boolean collapsed;
 
         CollapsibleSection(String title, JComponent content, boolean collapsible, JComponent collapsedPreview) {
@@ -1877,19 +2965,28 @@ public class Main {
             this.collapsible = collapsible;
             setBorder(new EmptyBorder(16, 16, 16, 16));
 
-            JPanel header = new JPanel(new BorderLayout(8, 8));
-            header.setOpaque(false);
+            headerPanel = new JPanel(new BorderLayout(8, 8));
+            headerPanel.setOpaque(false);
             titleLabel = new JLabel(title);
             titleLabel.setFont(titleLabel.getFont().deriveFont(Font.BOLD, 16f));
-            header.add(titleLabel, BorderLayout.WEST);
+            headerPanel.add(titleLabel, BorderLayout.WEST);
 
+            headerActionsPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+            headerActionsPanel.setOpaque(false);
             toggleButton = new RoundedButton(collapsible ? "Collapse" : "Open");
             toggleButton.setVisible(collapsible);
-            toggleButton.addActionListener(e -> setCollapsed(!collapsed));
-            header.add(toggleButton, BorderLayout.EAST);
+            toggleButton.addActionListener(e -> {
+                if (toggleHandler != null) {
+                    toggleHandler.accept(!collapsed);
+                } else {
+                    setCollapsed(!collapsed);
+                }
+            });
+            headerActionsPanel.add(toggleButton);
+            headerPanel.add(headerActionsPanel, BorderLayout.EAST);
 
             content.setOpaque(false);
-            add(header, BorderLayout.NORTH);
+            add(headerPanel, BorderLayout.NORTH);
             add(content, BorderLayout.CENTER);
             if (collapsedPreview != null) {
                 collapsedPreview.setVisible(false);
@@ -1902,10 +2999,36 @@ public class Main {
             return collapsed;
         }
 
+        String getTitleText() {
+            return titleLabel.getText();
+        }
+
+        void addHeaderAction(AbstractButton button) {
+            headerActionsPanel.add(button, Math.max(0, headerActionsPanel.getComponentCount() - 1));
+        }
+
+        void addHeaderMouseListener(MouseAdapter adapter) {
+            headerPanel.addMouseListener(adapter);
+            titleLabel.addMouseListener(adapter);
+        }
+
+        void addHeaderMouseMotionListener(MouseAdapter adapter) {
+            headerPanel.addMouseMotionListener(adapter);
+            titleLabel.addMouseMotionListener(adapter);
+        }
+
+        void setToggleHandler(Consumer<Boolean> toggleHandler) {
+            this.toggleHandler = toggleHandler;
+        }
+
         void setCollapsed(boolean collapsed) {
             if (!collapsible) {
                 return;
             }
+            setCollapsedDirect(collapsed);
+        }
+
+        void setCollapsedDirect(boolean collapsed) {
             this.collapsed = collapsed;
             content.setVisible(!collapsed);
             if (collapsedPreview != null) {
@@ -1921,6 +3044,114 @@ public class Main {
                 toggleButton.setText(collapsed ? "Expand" : "Collapse");
             }
         }
+    }
+
+    private static class DockSlotPanel extends JPanel {
+        private final String slotId;
+        private CollapsibleSection section;
+        private final Border normalBorder = BorderFactory.createEmptyBorder();
+        private final Border highlightBorder = BorderFactory.createLineBorder(new Color(67, 131, 214), 2, true);
+
+        DockSlotPanel(String slotId) {
+            super(new BorderLayout());
+            this.slotId = slotId;
+            putClientProperty(TRANSPARENT_PANEL_PROPERTY, Boolean.TRUE);
+            setOpaque(false);
+            setBorder(normalBorder);
+        }
+
+        String getSlotId() {
+            return slotId;
+        }
+
+        CollapsibleSection getSection() {
+            return section;
+        }
+
+        void setSection(CollapsibleSection section) {
+            removeAll();
+            this.section = section;
+            if (section != null) {
+                add(section, BorderLayout.CENTER);
+            }
+            revalidate();
+            repaint();
+        }
+
+        void setHighlighted(boolean highlighted) {
+            setBorder(highlighted ? highlightBorder : normalBorder);
+        }
+    }
+
+    private class DockDragHandler extends MouseAdapter {
+        private final String sectionId;
+        private final CollapsibleSection section;
+        private Point pressedScreenPoint;
+        private Point dialogStartPoint;
+
+        private DockDragHandler(String sectionId, CollapsibleSection section) {
+            this.sectionId = sectionId;
+            this.section = section;
+        }
+
+        @Override
+        public void mousePressed(MouseEvent e) {
+            pressedScreenPoint = e.getLocationOnScreen();
+            JDialog dialog = floatingSectionDialogs.get(sectionId);
+            dialogStartPoint = dialog != null ? dialog.getLocation() : null;
+        }
+
+        @Override
+        public void mouseDragged(MouseEvent e) {
+            Point currentPoint = e.getLocationOnScreen();
+            JDialog dialog = floatingSectionDialogs.get(sectionId);
+            if (dialog != null && dialogStartPoint != null && pressedScreenPoint != null) {
+                dialog.setLocation(
+                        dialogStartPoint.x + (currentPoint.x - pressedScreenPoint.x),
+                        dialogStartPoint.y + (currentPoint.y - pressedScreenPoint.y)
+                );
+            }
+            if (isPointInsideMainWindow(currentPoint)) {
+                highlightDockTarget(findDockSlotAt(currentPoint));
+            } else {
+                clearDockHighlights();
+            }
+        }
+
+        @Override
+        public void mouseReleased(MouseEvent e) {
+            Point releasePoint = e.getLocationOnScreen();
+            clearDockHighlights();
+            if (isPointInsideMainWindow(releasePoint)) {
+                String targetSlotId = findDockSlotAt(releasePoint);
+                if (targetSlotId != null) {
+                    moveDockSection(sectionId, targetSlotId, true);
+                }
+            } else {
+                floatSection(sectionId, new Point(releasePoint.x - 40, releasePoint.y - 20));
+            }
+            pressedScreenPoint = null;
+            dialogStartPoint = null;
+        }
+    }
+
+    @FunctionalInterface
+    private interface ComboItemFormatter {
+        String format(Object value);
+    }
+
+    private record ResponsiveLayoutPlan(LayoutMode mode, List<String> visibleSectionIds, List<String> overflowSectionIds) {}
+
+    private enum LayoutMode {
+        FOUR_WIDE,
+        THREE_WIDE,
+        TWO_WIDE,
+        ONE_WIDE,
+        FOUR_TALL,
+        THREE_TALL,
+        TWO_TALL,
+        ONE_TALL,
+        TWO_BY_TWO
     }
 
     private static class RoundedBorder extends AbstractBorder {

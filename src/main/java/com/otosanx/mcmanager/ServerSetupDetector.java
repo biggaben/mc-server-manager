@@ -1,6 +1,7 @@
 package com.otosanx.mcmanager;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -16,9 +17,13 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.jar.Attributes;
+import java.util.jar.JarFile;
+import java.util.jar.Manifest;
 
 public final class ServerSetupDetector {
     private static final Pattern MEMORY_PATTERN = Pattern.compile("^-X(ms|mx)(.+)$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern MC_VERSION_PATTERN = Pattern.compile("(1\\.\\d{1,2}(?:\\.\\d+)?)");
     private static final Set<String> SCRIPT_EXTENSIONS = Set.of(".bat", ".cmd", ".ps1", ".sh");
     private static final String DEFAULT_JVM_ARGS = "-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=100 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -Dfile.encoding=UTF-8";
 
@@ -88,6 +93,7 @@ public final class ServerSetupDetector {
         if (selectedJar != null) {
             accumulator.jarPath = relativizeIfPossible(serverFolder, selectedJar);
             accumulator.serverType = detectType(accumulator.serverType, selectedJar.getFileName().toString(), serverFolder);
+            detectMinecraftVersion(accumulator, serverFolder, selectedJar);
         }
 
         if (accumulator.jarPath == null) {
@@ -96,9 +102,15 @@ public final class ServerSetupDetector {
 
         if (accumulator.jarPath != null) {
             accumulator.serverType = detectType(accumulator.serverType, accumulator.jarPath, serverFolder);
+            detectMinecraftVersion(accumulator, serverFolder, serverFolder.resolve(accumulator.jarPath));
         } else {
             accumulator.serverType = detectType(accumulator.serverType, "", serverFolder);
         }
+
+        if (accumulator.minecraftVersion == null) {
+            detectMinecraftVersionFromFolder(accumulator, serverFolder);
+        }
+        accumulator.likelyRequiredJava = inferLikelyRequiredJava(accumulator.minecraftVersion, accumulator.serverType);
     }
 
     private static void finalizeDefaults(DetectionAccumulator accumulator) {
@@ -110,6 +122,15 @@ public final class ServerSetupDetector {
         }
         if (accumulator.messages.isEmpty()) {
             accumulator.messages.add("No existing launch script found, using defaults.");
+        }
+        if (accumulator.minecraftVersion != null) {
+            accumulator.messages.add("Detected Minecraft version: " + accumulator.minecraftVersion + ".");
+        } else {
+            accumulator.messages.add("Detected Minecraft version: Unknown.");
+        }
+        accumulator.messages.add("Detected loader: " + accumulator.serverType.displayName() + ".");
+        if (accumulator.likelyRequiredJava > 0) {
+            accumulator.messages.add("Likely Java requirement: Java " + accumulator.likelyRequiredJava + ".");
         }
     }
 
@@ -183,6 +204,13 @@ public final class ServerSetupDetector {
                 String jarToken = stripWrapping(queue.removeFirst());
                 accumulator.jarPath = relativizeIfPossible(accumulator.serverFolder, resolvePathString(workingDirectory, jarToken));
                 accumulator.serverType = detectType(accumulator.serverType, jarToken, accumulator.serverFolder);
+                if (accumulator.minecraftVersion == null) {
+                    String detectedVersion = extractMcVersion(jarToken);
+                    if (detectedVersion != null) {
+                        accumulator.minecraftVersion = detectedVersion;
+                        accumulator.versionSource = source.getFileName() + " launcher";
+                    }
+                }
                 afterJar = true;
                 continue;
             }
@@ -190,6 +218,13 @@ public final class ServerSetupDetector {
             if (looksLikeJar(cleaned) && accumulator.jarPath == null) {
                 accumulator.jarPath = relativizeIfPossible(accumulator.serverFolder, resolvePathString(workingDirectory, cleaned));
                 accumulator.serverType = detectType(accumulator.serverType, cleaned, accumulator.serverFolder);
+                if (accumulator.minecraftVersion == null) {
+                    String detectedVersion = extractMcVersion(cleaned);
+                    if (detectedVersion != null) {
+                        accumulator.minecraftVersion = detectedVersion;
+                        accumulator.versionSource = source.getFileName() + " launcher";
+                    }
+                }
                 afterJar = true;
                 continue;
             }
@@ -308,6 +343,137 @@ public final class ServerSetupDetector {
         if (lower.contains("forge")) return 2;
         if (lower.equals("server.jar")) return 3;
         return 4;
+    }
+
+    private static void detectMinecraftVersion(DetectionAccumulator accumulator, Path serverFolder, Path jarPath) {
+        if (jarPath == null) {
+            return;
+        }
+        if (!Files.isRegularFile(jarPath) && jarPath.getFileName() != null) {
+            String fromName = extractMcVersion(jarPath.getFileName().toString());
+            if (fromName != null && accumulator.minecraftVersion == null) {
+                accumulator.minecraftVersion = fromName;
+                accumulator.versionSource = "jar file name";
+                return;
+            }
+        }
+        if (!Files.isRegularFile(jarPath)) {
+            return;
+        }
+
+        String fromName = extractMcVersion(jarPath.getFileName().toString());
+        if (fromName != null && accumulator.minecraftVersion == null) {
+            accumulator.minecraftVersion = fromName;
+            accumulator.versionSource = "jar file name";
+        }
+
+        try (JarFile jarFile = new JarFile(jarPath.toFile())) {
+            Manifest manifest = jarFile.getManifest();
+            if (manifest != null && accumulator.minecraftVersion == null) {
+                Attributes attributes = manifest.getMainAttributes();
+                String[] manifestHints = {
+                        attributes.getValue("Implementation-Version"),
+                        attributes.getValue("Specification-Version"),
+                        attributes.getValue("Implementation-Title")
+                };
+                for (String hint : manifestHints) {
+                    String version = extractMcVersion(hint);
+                    if (version != null) {
+                        accumulator.minecraftVersion = version;
+                        accumulator.versionSource = "jar manifest";
+                        break;
+                    }
+                }
+            }
+
+            if (accumulator.minecraftVersion == null) {
+                var entries = jarFile.entries();
+                while (entries.hasMoreElements()) {
+                    var entry = entries.nextElement();
+                    String lower = entry.getName().toLowerCase(Locale.ROOT);
+                    if (lower.endsWith("version.json")) {
+                        try (InputStream input = jarFile.getInputStream(entry)) {
+                            String content = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+                            String version = extractMcVersion(content);
+                            if (version != null) {
+                                accumulator.minecraftVersion = version;
+                                accumulator.versionSource = entry.getName();
+                                break;
+                            }
+                        } catch (IOException ignored) {
+                        }
+                    }
+                }
+            }
+        } catch (IOException ignored) {
+        }
+    }
+
+    private static void detectMinecraftVersionFromFolder(DetectionAccumulator accumulator, Path serverFolder) {
+        List<Path> candidates = List.of(
+                serverFolder.resolve("version.json"),
+                serverFolder.resolve("versions").resolve("version.json"),
+                serverFolder.resolve("libraries")
+        );
+        for (Path candidate : candidates) {
+            if (Files.isRegularFile(candidate)) {
+                try {
+                    String content = Files.readString(candidate, StandardCharsets.UTF_8);
+                    String version = extractMcVersion(content);
+                    if (version != null) {
+                        accumulator.minecraftVersion = version;
+                        accumulator.versionSource = serverFolder.relativize(candidate).toString();
+                        return;
+                    }
+                } catch (IOException ignored) {
+                }
+            }
+        }
+
+        try {
+            if (Files.isDirectory(serverFolder.resolve("libraries"))) {
+                Files.walk(serverFolder.resolve("libraries"), 5)
+                        .filter(Files::isRegularFile)
+                        .filter(path -> path.getFileName().toString().equalsIgnoreCase("version.json"))
+                        .findFirst()
+                        .ifPresent(path -> {
+                            try {
+                                String content = Files.readString(path, StandardCharsets.UTF_8);
+                                String version = extractMcVersion(content);
+                                if (version != null && accumulator.minecraftVersion == null) {
+                                    accumulator.minecraftVersion = version;
+                                    accumulator.versionSource = serverFolder.relativize(path).toString();
+                                }
+                            } catch (IOException ignored) {
+                            }
+                        });
+            }
+        } catch (IOException ignored) {
+        }
+    }
+
+    private static String extractMcVersion(String text) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        Matcher matcher = MC_VERSION_PATTERN.matcher(text);
+        return matcher.find() ? matcher.group(1) : null;
+    }
+
+    private static int inferLikelyRequiredJava(String minecraftVersion, ServerType serverType) {
+        if (minecraftVersion != null) {
+            if (minecraftVersion.startsWith("1.21") || minecraftVersion.startsWith("1.20.5") || minecraftVersion.startsWith("1.20.6")) {
+                return 21;
+            }
+            if (minecraftVersion.startsWith("1.17") || minecraftVersion.startsWith("1.18") || minecraftVersion.startsWith("1.19")
+                    || minecraftVersion.startsWith("1.20")) {
+                return 17;
+            }
+        }
+        if (serverType == ServerType.FABRIC || serverType == ServerType.FORGE || serverType == ServerType.NEOFORGE) {
+            return 17;
+        }
+        return 8;
     }
 
     private static ServerType detectType(ServerType current, String jarOrHint, Path serverFolder) {
@@ -441,6 +607,9 @@ public final class ServerSetupDetector {
         private String xmx;
         private String jvmArgs;
         private String serverArgs;
+        private String minecraftVersion;
+        private String versionSource;
+        private int likelyRequiredJava;
         private final List<String> messages = new ArrayList<>();
 
         private DetectionAccumulator(Path serverFolder, Path selectedJar) {
@@ -458,6 +627,9 @@ public final class ServerSetupDetector {
                     xmx,
                     jvmArgs,
                     serverArgs,
+                    minecraftVersion,
+                    versionSource,
+                    likelyRequiredJava,
                     compactMessages,
                     selectedJar != null || jarPath != null || javaPath != null || xms != null || xmx != null || (jvmArgs != null && !jvmArgs.isBlank())
             );
@@ -472,6 +644,9 @@ public final class ServerSetupDetector {
             String xmx,
             String jvmArgs,
             String serverArgs,
+            String minecraftVersion,
+            String versionSource,
+            int likelyRequiredJava,
             List<String> messages,
             boolean foundAnything
     ) {

@@ -66,6 +66,37 @@ public final class LaunchFileService {
         return new SyncResult(false, "Detected launcher is too custom to update safely. Saved internal config only.");
     }
 
+    public static List<Path> getManagedFilesForBackup(Path serverFolder, ServerSetupDetector.DetectionResult detection) {
+        List<Path> files = new ArrayList<>();
+        if (serverFolder == null || !Files.isDirectory(serverFolder)) {
+            return files;
+        }
+
+        Path primary = detectPrimaryLaunchFile(serverFolder);
+        Path userJvmArgs = serverFolder.resolve("user_jvm_args.txt");
+
+        if ((detection.serverType() == ServerSetupDetector.ServerType.FORGE || detection.serverType() == ServerSetupDetector.ServerType.NEOFORGE)
+                && Files.isRegularFile(userJvmArgs)) {
+            files.add(userJvmArgs);
+        }
+        if (primary != null && Files.isRegularFile(primary) && !files.contains(primary)) {
+            files.add(primary);
+        }
+        return files;
+    }
+
+    public static String describeManagedTarget(Path serverFolder, ServerSetupDetector.DetectionResult detection) {
+        List<Path> files = getManagedFilesForBackup(serverFolder, detection);
+        if (files.isEmpty()) {
+            return "Internal app config only";
+        }
+        List<String> names = new ArrayList<>();
+        for (Path file : files) {
+            names.add(file.getFileName().toString());
+        }
+        return String.join(", ", names);
+    }
+
     public static Recommendation buildRecommendedJvmArgs(ServerSetupDetector.ServerType type, String xmx, String currentArgs) {
         String normalized = currentArgs == null ? "" : currentArgs.trim();
         boolean advanced = normalized.split("\\s+").length > 6 && !normalized.equals(DEFAULT_RECOMMENDED_ARGS);

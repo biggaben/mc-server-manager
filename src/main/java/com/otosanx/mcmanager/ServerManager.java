@@ -22,6 +22,14 @@ public class ServerManager {
         OFFLINE, STARTING, ONLINE, STOPPING, CRASHED
     }
 
+    public enum RestartDisplayState {
+        DISABLED,
+        NONE_PENDING,
+        SCHEDULED,
+        RESTARTING_NOW,
+        CANCELED
+    }
+
     private final ExecutorService executor = Executors.newCachedThreadPool();
     private Process process;
     private PrintWriter writer;
@@ -29,6 +37,7 @@ public class ServerManager {
     private volatile boolean stopRequested = false;
     private volatile boolean restartRequested = false;
     private volatile boolean restartCancelled = false;
+    private volatile boolean restartCanceledStateVisible = false;
     private volatile long processStartTimeMillis = 0L;
     private volatile long pendingRestartUntilMillis = 0L;
     private volatile String lastRestartReason = "None pending";
@@ -80,6 +89,7 @@ public class ServerManager {
         processStartTimeMillis = System.currentTimeMillis();
         pendingRestartUntilMillis = 0L;
         restartCancelled = false;
+        restartCanceledStateVisible = false;
         lastRestartReason = "Server started";
         writer = new PrintWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8), true);
 
@@ -135,6 +145,7 @@ public class ServerManager {
         stopRequested = true;
         restartRequested = true;
         restartCancelled = false;
+        restartCanceledStateVisible = false;
         lastRestartReason = "Manual restart requested";
         setState(State.STOPPING);
         executor.submit(() -> {
@@ -177,6 +188,7 @@ public class ServerManager {
             restartCancelled = true;
             restartRequested = false;
             pendingRestartUntilMillis = 0L;
+            restartCanceledStateVisible = true;
             lastRestartReason = "Restart cancelled by user";
             return true;
         }
@@ -208,8 +220,49 @@ public class ServerManager {
         return process.toHandle().info().totalCpuDuration().map(duration -> duration.toMillis()).orElse(-1L);
     }
 
+    public synchronized long getProcessMemoryBytes() {
+        if (!isRunning() || process == null) {
+            return -1L;
+        }
+        long pid = process.pid();
+        try {
+            Process probe = new ProcessBuilder(
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-Process -Id " + pid + " -ErrorAction SilentlyContinue).WorkingSet64"
+            ).start();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(probe.getInputStream(), StandardCharsets.UTF_8))) {
+                String line = reader.readLine();
+                probe.waitFor(2, TimeUnit.SECONDS);
+                if (line == null || line.isBlank()) {
+                    return -1L;
+                }
+                return Long.parseLong(line.trim());
+            }
+        } catch (Exception ignored) {
+            return -1L;
+        }
+    }
+
     public synchronized String getLastRestartReason() {
         return lastRestartReason;
+    }
+
+    public synchronized RestartDisplayState getRestartDisplayState() {
+        if (pendingRestartUntilMillis > 0L) {
+            return RestartDisplayState.SCHEDULED;
+        }
+        if (restartCanceledStateVisible) {
+            return RestartDisplayState.CANCELED;
+        }
+        if (restartRequested || (state == State.STOPPING && "Manual restart requested".equals(lastRestartReason))) {
+            return RestartDisplayState.RESTARTING_NOW;
+        }
+        if (currentConfig == null || !currentConfig.autoRestartOnCrash) {
+            return RestartDisplayState.DISABLED;
+        }
+        return RestartDisplayState.NONE_PENDING;
     }
 
     private void readOutput() {
@@ -260,11 +313,13 @@ public class ServerManager {
                         setState(State.OFFLINE);
                         pendingRestartUntilMillis = 0L;
                         restartCancelled = false;
+                        restartCanceledStateVisible = true;
                         return;
                     }
                     TimeUnit.MILLISECONDS.sleep(250);
                 }
                 pendingRestartUntilMillis = 0L;
+                restartCanceledStateVisible = false;
                 start(currentConfig);
             }
         } catch (InterruptedException e) {
