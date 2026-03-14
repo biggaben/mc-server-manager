@@ -28,6 +28,10 @@ public class ServerManager {
     private volatile State state = State.OFFLINE;
     private volatile boolean stopRequested = false;
     private volatile boolean restartRequested = false;
+    private volatile boolean restartCancelled = false;
+    private volatile long processStartTimeMillis = 0L;
+    private volatile long pendingRestartUntilMillis = 0L;
+    private volatile String lastRestartReason = "None pending";
     private AppConfig currentConfig;
     private Consumer<String> logConsumer = s -> {};
     private Consumer<State> stateConsumer = s -> {};
@@ -73,6 +77,10 @@ public class ServerManager {
         pb.redirectErrorStream(true);
         log("Launching: " + String.join(" ", command));
         process = pb.start();
+        processStartTimeMillis = System.currentTimeMillis();
+        pendingRestartUntilMillis = 0L;
+        restartCancelled = false;
+        lastRestartReason = "Server started";
         writer = new PrintWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8), true);
 
         executor.submit(this::readOutput);
@@ -126,6 +134,8 @@ public class ServerManager {
         }
         stopRequested = true;
         restartRequested = true;
+        restartCancelled = false;
+        lastRestartReason = "Manual restart requested";
         setState(State.STOPPING);
         executor.submit(() -> {
             try {
@@ -156,9 +166,50 @@ public class ServerManager {
                 process.destroyForcibly();
             }
             log("Server process killed.");
+            lastRestartReason = "Force kill used";
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    public synchronized boolean cancelPendingRestart() {
+        if (pendingRestartUntilMillis > 0L) {
+            restartCancelled = true;
+            restartRequested = false;
+            pendingRestartUntilMillis = 0L;
+            lastRestartReason = "Restart cancelled by user";
+            return true;
+        }
+        return false;
+    }
+
+    public synchronized boolean isRestartPending() {
+        return pendingRestartUntilMillis > 0L;
+    }
+
+    public synchronized long getPendingRestartSeconds() {
+        if (pendingRestartUntilMillis <= 0L) {
+            return 0L;
+        }
+        return Math.max(0L, (pendingRestartUntilMillis - System.currentTimeMillis() + 999L) / 1000L);
+    }
+
+    public synchronized long getUptimeMillis() {
+        if (!isRunning() || processStartTimeMillis <= 0L) {
+            return 0L;
+        }
+        return System.currentTimeMillis() - processStartTimeMillis;
+    }
+
+    public synchronized long getProcessCpuMillis() {
+        if (!isRunning() || process == null) {
+            return -1L;
+        }
+        return process.toHandle().info().totalCpuDuration().map(duration -> duration.toMillis()).orElse(-1L);
+    }
+
+    public synchronized String getLastRestartReason() {
+        return lastRestartReason;
     }
 
     private void readOutput() {
@@ -186,20 +237,34 @@ public class ServerManager {
                 if (restartRequested) {
                     shouldRestart = true;
                     restartRequested = false;
+                    lastRestartReason = "Manual restart scheduled";
                 } else if (!stopRequested && currentConfig != null && currentConfig.autoRestartOnCrash) {
                     shouldRestart = true;
                     restartDelay = currentConfig.autoRestartDelaySeconds;
                     setState(State.CRASHED);
                     log("Crash detected. Auto-restart enabled.");
+                    lastRestartReason = "Crash restart scheduled";
                 } else {
                     setState(State.OFFLINE);
+                    processStartTimeMillis = 0L;
                 }
                 stopRequested = false;
             }
 
             if (shouldRestart && currentConfig != null) {
                 log("Restarting in " + restartDelay + " seconds...");
-                TimeUnit.SECONDS.sleep(restartDelay);
+                pendingRestartUntilMillis = System.currentTimeMillis() + (restartDelay * 1000L);
+                while (System.currentTimeMillis() < pendingRestartUntilMillis) {
+                    if (restartCancelled) {
+                        log("Restart cancelled by user.");
+                        setState(State.OFFLINE);
+                        pendingRestartUntilMillis = 0L;
+                        restartCancelled = false;
+                        return;
+                    }
+                    TimeUnit.MILLISECONDS.sleep(250);
+                }
+                pendingRestartUntilMillis = 0L;
                 start(currentConfig);
             }
         } catch (InterruptedException e) {
