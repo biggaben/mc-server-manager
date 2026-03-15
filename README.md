@@ -15,6 +15,14 @@ A simple desktop app for running a Minecraft dedicated server without the normal
 - Minimize to tray / run in the background
 - Start minimized option
 
+## Recent Improvements (v1.0.1)
+
+- Enhanced UI responsiveness by making performance monitoring fully asynchronous.
+- Fixed thread-blocking bugs when force-killing servers or reading memory stats.
+- Eliminated Windows OS file handle leaks during directory scanning.
+- Fixed logic bugs that previously wiped essential memory arguments in launch scripts.
+- See the [CHANGELOG.md](CHANGELOG.md) for full details.
+
 ## What you need
 
 - Windows recommended

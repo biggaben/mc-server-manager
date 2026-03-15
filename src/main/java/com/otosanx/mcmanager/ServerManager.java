@@ -171,16 +171,19 @@ public class ServerManager {
             return;
         }
         stopRequested = true;
-        process.destroy();
-        try {
-            if (!process.waitFor(3, TimeUnit.SECONDS)) {
-                process.destroyForcibly();
+        Process p = process;
+        p.destroy();
+        lastRestartReason = "Force kill used";
+        executor.submit(() -> {
+            try {
+                if (!p.waitFor(3, TimeUnit.SECONDS)) {
+                    p.destroyForcibly();
+                }
+                log("Server process killed.");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
-            log("Server process killed.");
-            lastRestartReason = "Force kill used";
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        });
     }
 
     public synchronized boolean cancelPendingRestart() {
@@ -220,7 +223,7 @@ public class ServerManager {
         return process.toHandle().info().totalCpuDuration().map(duration -> duration.toMillis()).orElse(-1L);
     }
 
-    public synchronized long getProcessMemoryBytes() {
+    public long getProcessMemoryBytes() {
         if (!isRunning() || process == null) {
             return -1L;
         }

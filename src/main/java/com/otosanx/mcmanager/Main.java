@@ -2451,6 +2451,8 @@ public class Main {
         updatePerformanceStats();
     }
 
+    private record PerformanceData(long uptimeMillis, long serverMemoryBytes, long serverCpuMillis, double systemCpuLoad, double usedSystemMemoryRatio) {}
+
     private void updatePerformanceStats() {
         if (perfStatusLabel == null) {
             return;
@@ -2470,56 +2472,61 @@ public class Main {
             return;
         }
 
-        perfUptimeLabel.setText(config.monitorUptime ? "Uptime: " + formatDuration(serverManager.getUptimeMillis()) : "Uptime: Disabled");
-        perfServerMemoryLabel.setText(config.monitorServerMemory
-                ? formatServerMemoryText(serverManager.getProcessMemoryBytes())
-                : "Server Memory: Disabled");
-
-        if (config.monitorTps || config.monitorPlayerCount || config.monitorLatency) {
-            List<String> parts = new ArrayList<>();
-            if (config.monitorTps) {
-                parts.add("TPS unavailable");
-            }
-            if (config.monitorPlayerCount) {
-                parts.add("players unavailable");
-            }
-            if (config.monitorLatency) {
-                parts.add("latency unavailable");
-            }
-            perfPlayersLabel.setText("Players/TPS: " + String.join(", ", parts));
-        } else {
-            perfPlayersLabel.setText("Players/TPS: Disabled");
-        }
-
-        if (config.monitorSystemCpu || config.monitorSystemMemory) {
-            try {
-                com.sun.management.OperatingSystemMXBean osBean =
-                        (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
-                if (config.monitorSystemCpu) {
-                    double cpuLoad = osBean.getCpuLoad();
-                    perfSystemCpuLabel.setText("System CPU: " + (cpuLoad >= 0 ? Math.round(cpuLoad * 100) + "%" : "Unavailable"));
-                } else {
-                    perfSystemCpuLabel.setText("System CPU: Disabled");
+        new SwingWorker<PerformanceData, Void>() {
+            @Override
+            protected PerformanceData doInBackground() {
+                long uptime = config.monitorUptime ? serverManager.getUptimeMillis() : -1L;
+                long serverMem = config.monitorServerMemory ? serverManager.getProcessMemoryBytes() : -1L;
+                long serverCpu = (config.monitorSystemCpu || config.monitorServerMemory) ? serverManager.getProcessCpuMillis() : -1L;
+                double sysCpu = -1d;
+                double sysMemRatio = -1d;
+                if (config.monitorSystemCpu || config.monitorSystemMemory) {
+                    try {
+                        com.sun.management.OperatingSystemMXBean osBean =
+                                (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+                        if (config.monitorSystemCpu) sysCpu = osBean.getCpuLoad();
+                        if (config.monitorSystemMemory) sysMemRatio = 1d - ((double) osBean.getFreeMemorySize() / (double) osBean.getTotalMemorySize());
+                    } catch (Exception ignored) {}
                 }
-                if (config.monitorSystemMemory) {
-                    double usedMemory = 1d - ((double) osBean.getFreeMemorySize() / (double) osBean.getTotalMemorySize());
-                    perfSystemMemoryLabel.setText("System Memory: " + Math.round(usedMemory * 100) + "% used");
-                } else {
-                    perfSystemMemoryLabel.setText("System Memory: Disabled");
-                }
-            } catch (Exception e) {
-                perfSystemCpuLabel.setText(config.monitorSystemCpu ? "System CPU: Unavailable" : "System CPU: Disabled");
-                perfSystemMemoryLabel.setText(config.monitorSystemMemory ? "System Memory: Unavailable" : "System Memory: Disabled");
+                return new PerformanceData(uptime, serverMem, serverCpu, sysCpu, sysMemRatio);
             }
-        } else {
-            perfSystemCpuLabel.setText("System CPU: Disabled");
-            perfSystemMemoryLabel.setText("System Memory: Disabled");
-        }
 
-        long serverCpuMillis = serverManager.getProcessCpuMillis();
-        perfServerCpuLabel.setText(config.monitorSystemCpu || config.monitorServerMemory
-                ? (serverCpuMillis >= 0 ? "Server CPU Time: " + formatDuration(serverCpuMillis) : "Server CPU Time: Unavailable")
-                : "Server CPU Time: Disabled");
+            @Override
+            protected void done() {
+                try {
+                    if (monitoringPausedForVisibility || !config.monitoringEnabled) return;
+                    PerformanceData data = get();
+                    perfUptimeLabel.setText(config.monitorUptime ? "Uptime: " + formatDuration(data.uptimeMillis()) : "Uptime: Disabled");
+                    perfServerMemoryLabel.setText(config.monitorServerMemory ? formatServerMemoryText(data.serverMemoryBytes()) : "Server Memory: Disabled");
+
+                    if (config.monitorTps || config.monitorPlayerCount || config.monitorLatency) {
+                        List<String> parts = new ArrayList<>();
+                        if (config.monitorTps) parts.add("TPS unavailable");
+                        if (config.monitorPlayerCount) parts.add("players unavailable");
+                        if (config.monitorLatency) parts.add("latency unavailable");
+                        perfPlayersLabel.setText("Players/TPS: " + String.join(", ", parts));
+                    } else {
+                        perfPlayersLabel.setText("Players/TPS: Disabled");
+                    }
+
+                    if (config.monitorSystemCpu) {
+                        perfSystemCpuLabel.setText("System CPU: " + (data.systemCpuLoad() >= 0 ? Math.round(data.systemCpuLoad() * 100) + "%" : "Unavailable"));
+                    } else {
+                        perfSystemCpuLabel.setText("System CPU: Disabled");
+                    }
+
+                    if (config.monitorSystemMemory) {
+                        perfSystemMemoryLabel.setText("System Memory: " + (data.usedSystemMemoryRatio() >= 0 ? Math.round(data.usedSystemMemoryRatio() * 100) + "% used" : "Unavailable"));
+                    } else {
+                        perfSystemMemoryLabel.setText("System Memory: Disabled");
+                    }
+
+                    perfServerCpuLabel.setText(config.monitorSystemCpu || config.monitorServerMemory
+                            ? (data.serverCpuMillis() >= 0 ? "Server CPU Time: " + formatDuration(data.serverCpuMillis()) : "Server CPU Time: Unavailable")
+                            : "Server CPU Time: Disabled");
+                } catch (Exception ignored) {}
+            }
+        }.execute();
     }
 
     private void setMonitoringDisabledMessage(String message) {

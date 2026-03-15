@@ -26,8 +26,8 @@ public final class LaunchFileService {
         if (serverFolder == null || !Files.isDirectory(serverFolder)) {
             return null;
         }
-        try {
-            return Files.list(serverFolder)
+        try (java.util.stream.Stream<Path> stream = Files.list(serverFolder)) {
+            return stream
                     .filter(Files::isRegularFile)
                     .filter(path -> {
                         String name = path.getFileName().toString().toLowerCase(Locale.ROOT);
@@ -172,9 +172,10 @@ public final class LaunchFileService {
     private static String patchLaunchLine(String line, AppConfig config) {
         String patched = line;
         patched = replaceJavaPath(patched, config.javaPath);
+        // Apply JVM args before Xms/Xmx to avoid accidentally wiping freshly inserted JVM memory args
+        patched = replaceJvmArgsBlock(patched, config.jvmArgs);
         patched = replaceOrInsert(patched, XMS_PATTERN, "-Xms" + config.xms, "java");
         patched = replaceOrInsert(patched, XMX_PATTERN, "-Xmx" + config.xmx, "java");
-        patched = replaceJvmArgsBlock(patched, config.jvmArgs);
         patched = replaceJarTarget(patched, config.jarFile);
         patched = replaceServerArgs(patched, config.serverArgs);
         return patched.trim();
@@ -203,15 +204,27 @@ public final class LaunchFileService {
         if (trimmedArgs.isBlank()) {
             return line;
         }
-        String withoutMemory = XMX_PATTERN.matcher(XMS_PATTERN.matcher(line).replaceAll("")).replaceAll("");
-        if (withoutMemory.contains("-jar")) {
-            int jarIndex = withoutMemory.toLowerCase(Locale.ROOT).indexOf("-jar");
-            String beforeJar = withoutMemory.substring(0, jarIndex);
-            String afterJar = withoutMemory.substring(jarIndex);
+        
+        int jarIndex = line.toLowerCase(Locale.ROOT).indexOf("-jar");
+        if (jarIndex >= 0) {
+            String beforeJar = line.substring(0, jarIndex);
+            String afterJar = line.substring(jarIndex);
+            
+            // Wipe strictly non-memory JVM args before -jar
+            // (Memory args are explicitly wiped or rewritten afterwards via Xms/Xmx logic in patchLaunchLine)
             beforeJar = beforeJar.replaceAll("(?i)\\s+-[^\\s]+", "");
             return beforeJar.trim() + " " + trimmedArgs + " " + afterJar.trim();
         }
-        return withoutMemory;
+        
+        Matcher matcher = JAVA_CMD_PATTERN.matcher(line);
+        if (matcher.find()) {
+            String afterJava = line.substring(matcher.end()).trim();
+            if (afterJava.contains(trimmedArgs)) {
+                afterJava = afterJava.replace(trimmedArgs, "").replaceAll("\\s{2,}", " ").trim();
+            }
+            return line.substring(0, matcher.end()).trim() + " " + trimmedArgs + " " + afterJava;
+        }
+        return line.trim() + " " + trimmedArgs;
     }
 
     private static String replaceJarTarget(String line, String jarFile) {

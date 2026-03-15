@@ -65,7 +65,8 @@ public final class ServerSetupDetector {
 
         try {
             if (Files.isDirectory(serverFolder.resolve("libraries"))) {
-                Files.walk(serverFolder.resolve("libraries"), 6)
+                try (java.util.stream.Stream<Path> stream = Files.walk(serverFolder.resolve("libraries"), 6)) {
+                    stream
                         .filter(Files::isRegularFile)
                         .filter(path -> {
                             String name = path.getFileName().toString().toLowerCase(Locale.ROOT);
@@ -73,14 +74,15 @@ public final class ServerSetupDetector {
                         })
                         .sorted()
                         .forEach(path -> parseTextFile(accumulator, path, false));
+                }
             }
         } catch (IOException ignored) {
         }
     }
 
     private static void parseLaunchScripts(DetectionAccumulator accumulator, Path serverFolder) {
-        try {
-            Files.list(serverFolder)
+        try (java.util.stream.Stream<Path> stream = Files.list(serverFolder)) {
+            stream
                     .filter(Files::isRegularFile)
                     .filter(path -> hasScriptExtension(path.getFileName().toString()))
                     .sorted(Comparator.comparing(path -> scriptPriority(path.getFileName().toString())))
@@ -323,8 +325,8 @@ public final class ServerSetupDetector {
                 return name;
             }
         }
-        try {
-            return Files.list(serverFolder)
+        try (java.util.stream.Stream<Path> stream = Files.list(serverFolder)) {
+            return stream
                     .filter(Files::isRegularFile)
                     .map(path -> path.getFileName().toString())
                     .filter(ServerSetupDetector::looksLikeJar)
@@ -432,7 +434,8 @@ public final class ServerSetupDetector {
 
         try {
             if (Files.isDirectory(serverFolder.resolve("libraries"))) {
-                Files.walk(serverFolder.resolve("libraries"), 5)
+                try (java.util.stream.Stream<Path> stream = Files.walk(serverFolder.resolve("libraries"), 5)) {
+                    stream
                         .filter(Files::isRegularFile)
                         .filter(path -> path.getFileName().toString().equalsIgnoreCase("version.json"))
                         .findFirst()
@@ -447,6 +450,7 @@ public final class ServerSetupDetector {
                             } catch (IOException ignored) {
                             }
                         });
+                }
             }
         } catch (IOException ignored) {
         }
